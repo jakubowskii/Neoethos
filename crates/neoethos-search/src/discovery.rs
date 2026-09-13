@@ -27,6 +27,13 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+const MIN_PBO_CANDIDATES: usize = 8;
+const ROBUST_WINDOW: usize = 150_000;
+const N_PERMUTATIONS: usize = 50;
+const PERMUTATION_P_VALUE_MAX: f64 = 0.05;
+const PLATEAU_MIN_RATIO: f64 = 0.30;
+const PLATEAU_VARIANT_COUNT: usize = 2;
+
 /// Typed runtime knobs that previously lived only in `NEOETHOS_BOT_*` env vars.
 ///
 /// These values change *production* discovery semantics (which features are
@@ -584,7 +591,6 @@ impl DiscoveryConfig {
             self.filtering.min_win_rate = 0.0;
             self.filtering.min_profit_factor = 0.0;
             self.filtering.anomaly_guard = false;
-            self.cpcv_min_phi = 0.0;
             // Lowered from 0.02 (~30 trades over 1500 days) to 0.001
             // (~1.5 trades over 1500 days) — the previous floor was
             // killing every gene whose `long_threshold` was just shy
@@ -654,7 +660,6 @@ impl DiscoveryConfig {
             self.filtering.min_win_rate = 0.0;
             self.filtering.min_profit_factor = 0.0;
             self.filtering.anomaly_guard = false;
-            self.cpcv_min_phi = 0.0;
             self.min_trades_per_day = 0.001;
             // No TF-scaling of trade-frequency floors and NO prop_firm_gate:
             // Risky is judged purely on growth, not challenge-passing.
@@ -795,8 +800,84 @@ pub struct DiscoveryFilterProfile {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct DiscoveryValidationGates {
+pub struct StrategyGateEvidence {
+    pub strategy_hash: String,
+    pub walkforward_executed: bool,
     pub walkforward_passed: bool,
+    pub walkforward_splits: usize,
+    pub cpcv_executed: bool,
+    pub cpcv_passed: bool,
+    pub cpcv_fold_count: usize,
+    pub cpcv_profitable_fold_ratio: f64,
+    pub cpcv_min_phi: f64,
+    pub pbo_executed: bool,
+    pub pbo_passed: bool,
+    pub pbo: Option<f64>,
+    pub pbo_max: f64,
+    pub pbo_candidates: usize,
+    pub pbo_splits: usize,
+    pub permutation_executed: bool,
+    pub permutation_passed: bool,
+    pub permutation_p_value: Option<f64>,
+    pub permutation_samples: usize,
+    pub plateau_executed: bool,
+    pub plateau_passed: bool,
+    pub plateau_min_ratio: Option<f64>,
+    pub plateau_variants: usize,
+}
+
+impl StrategyGateEvidence {
+    fn is_export_ready(&self) -> bool {
+        self.walkforward_executed
+            && self.walkforward_passed
+            && self.walkforward_splits > 0
+            && self.cpcv_executed
+            && self.cpcv_passed
+            && self.cpcv_fold_count > 0
+            && self.cpcv_min_phi.is_finite()
+            && self.cpcv_min_phi > 0.0
+            && self.cpcv_min_phi <= 1.0
+            && self.cpcv_profitable_fold_ratio.is_finite()
+            && (0.0..=1.0).contains(&self.cpcv_profitable_fold_ratio)
+            && self.cpcv_profitable_fold_ratio >= self.cpcv_min_phi
+            && self.pbo_executed
+            && self.pbo_passed
+            && self.pbo_candidates >= MIN_PBO_CANDIDATES
+            && self.pbo_splits > 0
+            && self.pbo_max.is_finite()
+            && self.pbo_max > 0.0
+            && self.pbo_max <= 1.0
+            && self
+                .pbo
+                .is_some_and(|value| {
+                    value.is_finite()
+                        && (0.0..=1.0).contains(&value)
+                        && value <= self.pbo_max
+                })
+            && self.permutation_executed
+            && self.permutation_passed
+            && self.permutation_samples == N_PERMUTATIONS
+            && self
+                .permutation_p_value
+                .is_some_and(|value| {
+                    value.is_finite()
+                        && (0.0..=1.0).contains(&value)
+                        && value < PERMUTATION_P_VALUE_MAX
+                })
+            && self.plateau_executed
+            && self.plateau_passed
+            && self.plateau_variants == PLATEAU_VARIANT_COUNT
+            && self
+                .plateau_min_ratio
+                .is_some_and(|value| value.is_finite() && value >= PLATEAU_MIN_RATIO)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryValidationGates {
+    pub walkforward_executed: bool,
+    pub walkforward_passed: bool,
+    pub cpcv_executed: bool,
     pub cpcv_passed: bool,
     pub canonical_backtest_artifacts: usize,
     pub walkforward_validation_artifacts: usize,
@@ -807,22 +888,22 @@ pub struct DiscoveryValidationGates {
     /// candidate set ranked at-or-below the median OUT-of-sample. `None` when
     /// not computable (too few candidates or the gate is disabled).
     pub pbo: Option<f64>,
-    /// False only when PBO was computed AND exceeded `config.max_pbo` —
-    /// a portfolio whose selection process looks like luck is not exportable.
+    pub pbo_executed: bool,
     pub pbo_passed: bool,
     /// How many candidate strategies fed the PBO estimate.
     pub pbo_candidates: usize,
+    pub pbo_splits: usize,
+    pub permutation_executed: bool,
+    pub permutation_passed: bool,
+    pub plateau_executed: bool,
+    pub plateau_passed: bool,
+    pub strategy_gate_evidence: Vec<StrategyGateEvidence>,
     /// Honesty counter: how many candidates the whole run RANKED before any
     /// gate — the selection pressure the survivors' metrics were bought with.
     pub trials_tested: usize,
     pub temporal_contract_hash: Option<String>,
-    /// Set when the prop-firm window-pass gate
-    /// (`NEOETHOS_BOT_DISCOVERY_PROP_FIRM_GATE=1`) replaces the walkforward
-    /// + CPCV consistency gates. Each portfolio member has already passed
-    /// FTMO-style rules on at least `pass_rate` of N random 30-day
-    /// windows from the dataset; this is what an actual prop-firm
-    /// challenge measures, so the much stricter "every walkforward
-    /// split must be profitable" requirement is bypassed here.
+    /// Additional prop-firm window-pass result. This never replaces mandatory
+    /// walk-forward, CPCV, PBO, permutation, or plateau validation.
     pub prop_firm_window_passed: bool,
     pub prop_firm_window_pass_rate: f64,
     pub prop_firm_window_count: usize,
@@ -844,15 +925,24 @@ pub struct DiscoveryValidationGates {
 impl DiscoveryValidationGates {
     pub fn pending() -> Self {
         Self {
+            walkforward_executed: false,
             walkforward_passed: false,
+            cpcv_executed: false,
             cpcv_passed: false,
             canonical_backtest_artifacts: 0,
             walkforward_validation_artifacts: 0,
             cpcv_fold_count: 0,
             cpcv_profitable_fold_ratio: 0.0,
             pbo: None,
-            pbo_passed: true, // pending gates fail on wf/cpcv; PBO only blocks when measured
+            pbo_executed: false,
+            pbo_passed: false,
             pbo_candidates: 0,
+            pbo_splits: 0,
+            permutation_executed: false,
+            permutation_passed: false,
+            plateau_executed: false,
+            plateau_passed: false,
+            strategy_gate_evidence: Vec::new(),
             trials_tested: 0,
             temporal_contract_hash: None,
             prop_firm_window_passed: false,
@@ -864,19 +954,18 @@ impl DiscoveryValidationGates {
     }
 
     pub fn is_portfolio_export_ready(&self) -> bool {
-        // MANDATORY out-of-sample validation (operator directive 2026-06-30):
-        // a strategy is export-ready ONLY if it passed BOTH out-of-sample gates
-        // — walkforward AND CPCV. The prop-firm window is an ADDITIONAL
-        // requirement for prop-firm runs (folded into `walkforward_passed` via
-        // the mode-aware criterion), never a bypass. This closes the hole where
-        // a strategy that FAILED walkforward (e.g. AUDUSD: 20 live trades, all
-        // losing) was still exported because it cleared the prop-firm window.
-        //
-        // 2026-07-02: plus the PBO gate — when the Probability of Backtest
-        // Overfitting was measured and exceeded the configured ceiling, the
-        // selection process is statistically indistinguishable from luck and
-        // nothing gets exported, no matter how good the survivors look.
-        self.walkforward_passed && self.cpcv_passed && self.pbo_passed
+        // Mandatory production export invariant. Skipped or invalid gates keep
+        // their executed/pass flags false.
+        self.walkforward_executed
+            && self.walkforward_passed
+            && self.cpcv_executed
+            && self.cpcv_passed
+            && self.pbo_executed
+            && self.pbo_passed
+            && self.permutation_executed
+            && self.permutation_passed
+            && self.plateau_executed
+            && self.plateau_passed
     }
 }
 
@@ -900,11 +989,13 @@ pub struct DiscoveryRunProfile {
     pub cpcv_embargo_pct: f64,
     pub cpcv_purge_pct: f64,
     pub cpcv_min_phi: f64,
+    pub max_pbo: f64,
     pub filters: DiscoveryFilterProfile,
     pub candidates_observed: usize,
     pub portfolio_observed: usize,
     pub quality_metrics_observed: usize,
     pub logged_trade_sets: usize,
+    pub validation_gates: DiscoveryValidationGates,
     pub walkforward_passed: bool,
     pub cpcv_passed: bool,
     pub canonical_backtest_artifacts_observed: usize,
@@ -1462,6 +1553,7 @@ struct DiscoveryWalkforwardPolicy {
     cpcv_embargo_pct: f64,
     cpcv_purge_pct: f64,
     cpcv_min_phi: f64,
+    max_pbo: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1514,6 +1606,7 @@ fn discovery_temporal_contract(
         cpcv_embargo_pct: config.cpcv_embargo_pct,
         cpcv_purge_pct: config.cpcv_purge_pct,
         cpcv_min_phi: config.cpcv_min_phi,
+        max_pbo: config.max_pbo,
     })?;
     let live_readiness_policy_hash = stable_json_hash(&DiscoveryLiveReadinessPolicy {
         portfolio_size_target: config.portfolio_size,
@@ -1632,6 +1725,202 @@ fn walkforward_summary_passed(summary: &WalkforwardSummary, mode: DiscoveryMode)
         && summary.all_min_trading_days_ok
 }
 
+fn walkforward_summary_has_valid_evidence(summary: &WalkforwardSummary) -> bool {
+    summary.walk_forward_splits > 0
+        && summary.splits.len() == summary.walk_forward_splits
+        && summary.avg_pnl.is_finite()
+        && summary.avg_win_rate.is_finite()
+        && summary.avg_max_dd.is_finite()
+        && summary.avg_max_consec_losses.is_finite()
+        && summary.avg_daily_min_dd.is_finite()
+        && summary.avg_max_daily_loss.is_finite()
+        && summary.splits.iter().all(|split| {
+            split.pnl.is_finite()
+                && split.win_rate.is_finite()
+                && split.max_dd.is_finite()
+                && split.daily_min_dd.is_finite()
+                && split.max_daily_loss.is_finite()
+                && split.max_daily_dd_pct.is_finite()
+                && split.daily_returns.iter().all(|value| value.is_finite())
+        })
+}
+
+#[derive(Debug)]
+struct CpcvGeneResult {
+    executed: bool,
+    passed: bool,
+    fold_count: usize,
+    profitable_fold_ratio: f64,
+}
+
+#[derive(Debug)]
+struct CpcvGateResult {
+    executed: bool,
+    passed: bool,
+    fold_count: usize,
+    profitable_fold_ratio: f64,
+    genes: Vec<CpcvGeneResult>,
+    pbo: Option<f64>,
+    pbo_executed: bool,
+    pbo_passed: bool,
+    pbo_candidates: usize,
+    pbo_splits: usize,
+}
+
+fn cpcv_gene_gate_result(
+    fold_count: usize,
+    profitable_folds: usize,
+    metrics_valid: bool,
+    min_phi: f64,
+) -> CpcvGeneResult {
+    let profitable_fold_ratio = if fold_count == 0 {
+        0.0
+    } else {
+        profitable_folds as f64 / fold_count as f64
+    };
+    let executed = fold_count > 0 && metrics_valid && profitable_fold_ratio.is_finite();
+    CpcvGeneResult {
+        executed,
+        passed: executed
+            && min_phi.is_finite()
+            && min_phi > 0.0
+            && profitable_fold_ratio >= min_phi,
+        fold_count,
+        profitable_fold_ratio,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RobustnessGateResult {
+    permutation_executed: bool,
+    permutation_passed: bool,
+    permutation_p_value: Option<f64>,
+    permutation_samples: usize,
+    plateau_executed: bool,
+    plateau_passed: bool,
+    plateau_min_ratio: Option<f64>,
+    plateau_variants: usize,
+}
+
+fn evaluate_robustness_evidence(
+    real_net: f64,
+    signal_bars: usize,
+    permutation_nets: Option<&[f64]>,
+    plateau_variant_nets: &[Option<f64>],
+) -> RobustnessGateResult {
+    let mut result = RobustnessGateResult {
+        permutation_executed: false,
+        permutation_passed: false,
+        permutation_p_value: None,
+        permutation_samples: 0,
+        plateau_executed: false,
+        plateau_passed: false,
+        plateau_min_ratio: None,
+        plateau_variants: 0,
+    };
+    if !real_net.is_finite() || real_net <= 0.0 || signal_bars < 30 {
+        return result;
+    }
+
+    let Some(permutation_nets) = permutation_nets else {
+        return result;
+    };
+    if permutation_nets.len() != N_PERMUTATIONS
+        || permutation_nets.iter().any(|value| !value.is_finite())
+    {
+        return result;
+    }
+    let beats = permutation_nets
+        .iter()
+        .filter(|value| **value >= real_net)
+        .count();
+    let p_value = beats as f64 / permutation_nets.len() as f64;
+    result.permutation_executed = true;
+    result.permutation_passed = p_value < PERMUTATION_P_VALUE_MAX;
+    result.permutation_p_value = Some(p_value);
+    result.permutation_samples = permutation_nets.len();
+    if !result.permutation_passed {
+        return result;
+    }
+
+    if plateau_variant_nets.len() != PLATEAU_VARIANT_COUNT
+        || plateau_variant_nets
+            .iter()
+            .any(|value| value.map_or(true, |net| !net.is_finite()))
+    {
+        return result;
+    }
+    let min_ratio = plateau_variant_nets
+        .iter()
+        .filter_map(|value| *value)
+        .map(|net| net / real_net)
+        .fold(f64::INFINITY, f64::min);
+    result.plateau_executed = min_ratio.is_finite();
+    result.plateau_passed = result.plateau_executed && min_ratio >= PLATEAU_MIN_RATIO;
+    result.plateau_min_ratio = result.plateau_executed.then_some(min_ratio);
+    result.plateau_variants = PLATEAU_VARIANT_COUNT;
+    result
+}
+
+fn retain_aligned<T>(items: &mut Vec<T>, keep: &[bool]) {
+    if items.len() != keep.len() {
+        items.clear();
+        return;
+    }
+    let mut index = 0usize;
+    items.retain(|_| {
+        let retain = keep[index];
+        index += 1;
+        retain
+    });
+}
+
+fn refresh_mandatory_gate_summary(gates: &mut DiscoveryValidationGates) {
+    let evidence = &gates.strategy_gate_evidence;
+    gates.walkforward_executed =
+        !evidence.is_empty() && evidence.iter().all(|item| item.walkforward_executed);
+    gates.walkforward_passed =
+        gates.walkforward_executed && evidence.iter().all(|item| item.walkforward_passed);
+    gates.cpcv_executed =
+        !evidence.is_empty() && evidence.iter().all(|item| item.cpcv_executed);
+    gates.cpcv_passed = gates.cpcv_executed && evidence.iter().all(|item| item.cpcv_passed);
+    gates.cpcv_fold_count = evidence.iter().map(|item| item.cpcv_fold_count).sum();
+    gates.cpcv_profitable_fold_ratio = evidence
+        .iter()
+        .map(|item| item.cpcv_profitable_fold_ratio)
+        .reduce(f64::min)
+        .unwrap_or(0.0);
+    gates.pbo_executed = !evidence.is_empty() && evidence.iter().all(|item| item.pbo_executed);
+    gates.pbo_passed = gates.pbo_executed && evidence.iter().all(|item| item.pbo_passed);
+    gates.pbo = evidence.first().and_then(|item| item.pbo);
+    gates.pbo_candidates = evidence.first().map_or(0, |item| item.pbo_candidates);
+    gates.pbo_splits = evidence.first().map_or(0, |item| item.pbo_splits);
+    gates.permutation_executed =
+        !evidence.is_empty() && evidence.iter().all(|item| item.permutation_executed);
+    gates.permutation_passed =
+        gates.permutation_executed && evidence.iter().all(|item| item.permutation_passed);
+    gates.plateau_executed =
+        !evidence.is_empty() && evidence.iter().all(|item| item.plateau_executed);
+    gates.plateau_passed =
+        gates.plateau_executed && evidence.iter().all(|item| item.plateau_passed);
+}
+
+fn pbo_gate_status(
+    pbo: Option<f64>,
+    max_pbo: f64,
+    candidates: usize,
+    splits: usize,
+) -> (bool, bool) {
+    let executed = candidates >= MIN_PBO_CANDIDATES
+        && splits > 0
+        && max_pbo.is_finite()
+        && (0.0..=1.0).contains(&max_pbo)
+        && max_pbo > 0.0
+        && pbo.is_some_and(|value| value.is_finite() && (0.0..=1.0).contains(&value));
+    let passed = executed && pbo.is_some_and(|value| value <= max_pbo);
+    (executed, passed)
+}
+
 fn evaluate_cpcv_gate(
     portfolio: &[Gene],
     // AREA 2 / Stage B (2026-06-09): the GPU population path re-synthesizes each
@@ -1646,28 +1935,36 @@ fn evaluate_cpcv_gate(
     months: &[i64],
     days: &[i64],
     pbo_candidates: &[Gene],
-) -> Result<(bool, usize, f64, Option<f64>, bool)> {
+) -> Result<CpcvGateResult> {
+    let pending = || CpcvGateResult {
+        executed: false,
+        passed: false,
+        fold_count: 0,
+        profitable_fold_ratio: 0.0,
+        genes: (0..portfolio.len())
+            .map(|_| CpcvGeneResult {
+                executed: false,
+                passed: false,
+                fold_count: 0,
+                profitable_fold_ratio: 0.0,
+            })
+            .collect(),
+        pbo: None,
+        pbo_executed: false,
+        pbo_passed: false,
+        pbo_candidates: pbo_candidates.len().min(64),
+        pbo_splits: 0,
+    };
     if portfolio.is_empty() {
-        return Ok((false, 0, 0.0, None, true));
+        return Ok(pending());
     }
-    // **F-018 documentation (2026-05-25)** — when CPCV is operator-
-    // disabled via `enable_cpcv = false`, this gate returns
-    // `(true, 0, 1.0)` so the discovery cycle continues. The original
-    // audit flagged this as "passes without running CPCV" — which is
-    // CORRECT: a disabled gate cannot fail. The fold_count of `0`
-    // surfaces in the run-profile so operators see "CPCV: disabled
-    // (0 folds)". Production prop-firm runs MUST keep CPCV enabled
-    // — the disable flag is only honoured for test fixtures /
-    // research-mode quick checks. Tracked by the upstream Settings-
-    // exposed `discovery.enable_cpcv` knob in `config.yaml`.
     if !config.enable_cpcv {
         tracing::warn!(
             target: "neoethos_search::discovery",
             "CPCV gate is DISABLED via config.enable_cpcv=false — \
-             portfolio promoted without out-of-sample validation. \
-             For prop-firm production runs, set enable_cpcv=true."
+             mandatory export validation remains failed."
         );
-        return Ok((true, 0, 1.0, None, true));
+        return Ok(pending());
     }
 
     let n = ohlcv.close.len();
@@ -1685,7 +1982,7 @@ fn evaluate_cpcv_gate(
     );
     let splits = cv.split(capped_n);
     if splits.is_empty() {
-        return Ok((false, 0, 0.0, None, true));
+        return Ok(pending());
     }
 
     // Alignment sanity check: the GPU path re-synthesizes signals on-device from
@@ -1716,6 +2013,9 @@ fn evaluate_cpcv_gate(
 
     let mut fold_count = 0usize;
     let mut profitable_folds = 0usize;
+    let mut gene_fold_counts = vec![0usize; portfolio.len()];
+    let mut gene_profitable_folds = vec![0usize; portfolio.len()];
+    let mut gene_metrics_valid = vec![true; portfolio.len()];
     let eval_config = config.evaluation_config(ohlcv.close.last().copied());
 
     // AREA 2 / Stage B (2026-06-09) — GPU-route the CPCV gate.
@@ -1747,7 +2047,7 @@ fn evaluate_cpcv_gate(
     let settings_template = if let Some(gene) = portfolio.first() {
         discovery_backtest_settings(config, gene, ohlcv.close.last().copied())
     } else {
-        return Ok((false, 0, 0.0, None, true));
+        return Ok(pending());
     };
 
     // Full-series indicators + SMC, computed ONCE and gathered per fold. The SMC
@@ -1805,24 +2105,41 @@ fn evaluate_cpcv_gate(
             );
         }
 
-        for m in metrics_per_gene {
+        for (gene_index, m) in metrics_per_gene.into_iter().enumerate() {
             // EXACT fold-pass criteria of the original serial loop — routed through
             // `BacktestMetrics` so net_profit/max_drawdown/trade_count (incl. the
             // trade-count rounding) are read identically.
+            let fold_metrics_valid = m[0].is_finite() && m[3].is_finite() && m[8].is_finite();
             let metrics = BacktestMetrics::from_metric_array(m);
             fold_count += 1;
+            gene_fold_counts[gene_index] += 1;
+            if !fold_metrics_valid {
+                gene_metrics_valid[gene_index] = false;
+                continue;
+            }
             let drawdown_ok =
                 config.filtering.max_dd <= 0.0 || metrics.max_drawdown <= config.filtering.max_dd;
             if metrics.trade_count > 0 && metrics.net_profit > 0.0 && drawdown_ok {
                 profitable_folds += 1;
+                gene_profitable_folds[gene_index] += 1;
             }
         }
     }
 
     if fold_count == 0 {
-        return Ok((false, 0, 0.0, None, true));
+        return Ok(pending());
     }
     let ratio = profitable_folds as f64 / fold_count as f64;
+    let genes: Vec<CpcvGeneResult> = gene_fold_counts
+        .into_iter()
+        .zip(gene_profitable_folds)
+        .zip(gene_metrics_valid)
+        .map(|((folds, profitable), metrics_valid)| {
+            cpcv_gene_gate_result(folds, profitable, metrics_valid, config.cpcv_min_phi)
+        })
+        .collect();
+    let cpcv_executed = !genes.is_empty() && genes.iter().all(|gene| gene.executed);
+    let cpcv_passed = cpcv_executed && genes.iter().all(|gene| gene.passed);
 
     // ── PBO — Probability of Backtest Overfitting (CSCV, López de Prado) ────
     // For each CPCV split: crown the IN-SAMPLE champion of the candidate pool
@@ -1833,8 +2150,13 @@ fn evaluate_cpcv_gate(
     // Reuses the exact fold gather + population evaluator of the gate above,
     // so IS/OOS are measured with the same engine (costs, sizing, SMC).
     let mut pbo: Option<f64> = None;
-    let mut pbo_passed = true;
-    if config.max_pbo > 0.0 && pbo_candidates.len() >= 8 {
+    let mut pbo_splits = 0usize;
+    let mut pbo_metrics_valid = true;
+    if config.max_pbo.is_finite()
+        && config.max_pbo > 0.0
+        && config.max_pbo <= 1.0
+        && pbo_candidates.len() >= MIN_PBO_CANDIDATES
+    {
         let cands: Vec<Gene> = pbo_candidates.iter().take(64).cloned().collect();
         let eval_pool = |idx: &[usize]| -> Result<Vec<f64>> {
             let absolute_idx: Vec<usize> = idx.iter().map(|i| offset + *i).collect();
@@ -1877,6 +2199,10 @@ fn evaluate_cpcv_gate(
             if is_perf.len() != cands.len() || oos_perf.len() != cands.len() {
                 anyhow::bail!("PBO: evaluator returned wrong candidate count — internal bug");
             }
+            if is_perf.iter().chain(&oos_perf).any(|value| !value.is_finite()) {
+                pbo_metrics_valid = false;
+                break;
+            }
             let Some(champion) = is_perf
                 .iter()
                 .enumerate()
@@ -1895,10 +2221,16 @@ fn evaluate_cpcv_gate(
                 champion_below_median += 1;
             }
         }
-        if splits_evaluated > 0 {
+        if pbo_metrics_valid && splits_evaluated > 0 {
             let p = champion_below_median as f64 / splits_evaluated as f64;
             pbo = Some(p);
-            pbo_passed = p <= config.max_pbo;
+            pbo_splits = splits_evaluated;
+            let (_, pbo_passed) = pbo_gate_status(
+                pbo,
+                config.max_pbo,
+                pbo_candidates.len().min(64),
+                pbo_splits,
+            );
             tracing::info!(
                 target: "neoethos_search::discovery",
                 pbo = format!("{p:.2}"),
@@ -1917,22 +2249,30 @@ fn evaluate_cpcv_gate(
                 );
             }
         }
-    } else if config.max_pbo > 0.0 {
+    } else {
         tracing::info!(
             target: "neoethos_search::discovery",
             candidates = pbo_candidates.len(),
-            "PBO not computed — needs ≥8 candidates in the selection pool \
-             (gate does not block)"
+            max_pbo = config.max_pbo,
+            "PBO not computed — mandatory export validation remains failed"
         );
     }
+    let pbo_candidates = pbo_candidates.len().min(64);
+    let (pbo_executed, pbo_passed) =
+        pbo_gate_status(pbo, config.max_pbo, pbo_candidates, pbo_splits);
 
-    Ok((
-        ratio >= config.cpcv_min_phi.clamp(0.0, 1.0),
+    Ok(CpcvGateResult {
+        executed: cpcv_executed,
+        passed: cpcv_passed,
         fold_count,
-        ratio,
+        profitable_fold_ratio: ratio,
+        genes,
         pbo,
+        pbo_executed,
         pbo_passed,
-    ))
+        pbo_candidates,
+        pbo_splits,
+    })
 }
 
 fn build_discovery_validation_artifacts(
@@ -1981,7 +2321,11 @@ fn build_discovery_validation_artifacts(
 
     let mut canonical_backtest_artifacts = Vec::with_capacity(portfolio.len());
     let mut walkforward_validation_artifacts = Vec::with_capacity(portfolio.len());
+    let mut strategy_hashes = Vec::with_capacity(portfolio.len());
+    let mut walkforward_executed = true;
     let mut walkforward_passed = true;
+    let mut walkforward_splits = Vec::with_capacity(portfolio.len());
+    let mut per_gene_wf_executed = Vec::with_capacity(portfolio.len());
     // Per-gene walk-forward pass flags (aligned to `portfolio` order). The caller
     // uses this in Risky mode to FILTER the exported portfolio down to the genes
     // that individually clear the risky walk-forward bar (selection pressure)
@@ -2088,6 +2432,7 @@ fn build_discovery_validation_artifacts(
     {
         let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
         let strategy_hash = stable_json_hash(gene)?;
+        strategy_hashes.push(strategy_hash.clone());
         let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
         // Regenerate per-bar confidence for risk-based, confidence-scaled
         // sizing. We reuse the precomputed `signals` for the signal vector
@@ -2117,8 +2462,13 @@ fn build_discovery_validation_artifacts(
             metrics,
         ));
 
-        let gene_wf_passed = walkforward_summary_passed(&walkforward_summary, config.mode);
+        let gene_wf_executed = walkforward_summary_has_valid_evidence(&walkforward_summary);
+        let gene_wf_passed =
+            gene_wf_executed && walkforward_summary_passed(&walkforward_summary, config.mode);
+        walkforward_executed &= gene_wf_executed;
         walkforward_passed &= gene_wf_passed;
+        walkforward_splits.push(walkforward_summary.walk_forward_splits);
+        per_gene_wf_executed.push(gene_wf_executed);
         per_gene_wf.push(gene_wf_passed);
         walkforward_validation_artifacts.push(WalkforwardValidationArtifactFile::new(
             WalkforwardValidationScope::for_strategy(
@@ -2131,28 +2481,68 @@ fn build_discovery_validation_artifacts(
         ));
     }
 
-    let (cpcv_passed, cpcv_fold_count, cpcv_profitable_fold_ratio, pbo, pbo_passed) =
-        evaluate_cpcv_gate(
-            portfolio,
-            portfolio_signals,
-            features,
-            ohlcv,
-            config,
-            &months,
-            &days,
-            pbo_candidates,
-        )?;
+    let cpcv = evaluate_cpcv_gate(
+        portfolio,
+        portfolio_signals,
+        features,
+        ohlcv,
+        config,
+        &months,
+        &days,
+        pbo_candidates,
+    )?;
+    let strategy_gate_evidence = strategy_hashes
+        .into_iter()
+        .enumerate()
+        .map(|(index, strategy_hash)| {
+            let cpcv_gene = &cpcv.genes[index];
+            StrategyGateEvidence {
+                strategy_hash,
+                walkforward_executed: per_gene_wf_executed[index],
+                walkforward_passed: per_gene_wf[index],
+                walkforward_splits: walkforward_splits[index],
+                cpcv_executed: cpcv_gene.executed,
+                cpcv_passed: cpcv_gene.passed,
+                cpcv_fold_count: cpcv_gene.fold_count,
+                cpcv_profitable_fold_ratio: cpcv_gene.profitable_fold_ratio,
+                cpcv_min_phi: config.cpcv_min_phi,
+                pbo_executed: cpcv.pbo_executed,
+                pbo_passed: cpcv.pbo_passed,
+                pbo: cpcv.pbo,
+                pbo_max: config.max_pbo,
+                pbo_candidates: cpcv.pbo_candidates,
+                pbo_splits: cpcv.pbo_splits,
+                permutation_executed: false,
+                permutation_passed: false,
+                permutation_p_value: None,
+                permutation_samples: 0,
+                plateau_executed: false,
+                plateau_passed: false,
+                plateau_min_ratio: None,
+                plateau_variants: 0,
+            }
+        })
+        .collect();
 
     let validation_gates = DiscoveryValidationGates {
+        walkforward_executed,
         walkforward_passed,
-        cpcv_passed,
+        cpcv_executed: cpcv.executed,
+        cpcv_passed: cpcv.passed,
         canonical_backtest_artifacts: canonical_backtest_artifacts.len(),
         walkforward_validation_artifacts: walkforward_validation_artifacts.len(),
-        cpcv_fold_count,
-        cpcv_profitable_fold_ratio,
-        pbo,
-        pbo_passed,
-        pbo_candidates: pbo_candidates.len().min(64),
+        cpcv_fold_count: cpcv.fold_count,
+        cpcv_profitable_fold_ratio: cpcv.profitable_fold_ratio,
+        pbo: cpcv.pbo,
+        pbo_executed: cpcv.pbo_executed,
+        pbo_passed: cpcv.pbo_passed,
+        pbo_candidates: cpcv.pbo_candidates,
+        pbo_splits: cpcv.pbo_splits,
+        permutation_executed: false,
+        permutation_passed: false,
+        plateau_executed: false,
+        plateau_passed: false,
+        strategy_gate_evidence,
         trials_tested,
         temporal_contract_hash: Some(temporal_contract_hash),
         prop_firm_window_passed: false,
@@ -4209,7 +4599,7 @@ where
     // already failed the bar would just burn the validation tail). They are
     // emitted honestly flagged `fallback_mode` and forced not-export-ready.
     let mut fallback_mode = false;
-    let (mut validation_gates, canonical_backtest_artifacts, walkforward_validation_artifacts, mut per_gene_wf) =
+    let (mut validation_gates, mut canonical_backtest_artifacts, mut walkforward_validation_artifacts, mut per_gene_wf) =
         if portfolio.is_empty() && !best_effort_fallback.is_empty() {
             fallback_mode = true;
             let fallback_reason = funnel
@@ -4287,18 +4677,10 @@ where
     //     sits on a performance PLATEAU (variants keep ≥30% of the real net);
     //     an overfit one falls off a cliff → drop the gene.
     //
-    // NEVER-ZERO: applied only when at least ONE gene survives; if they would
-    // empty the portfolio, keep it and warn loudly (OOS/PBO/demo gates remain
-    // the final authority).
     if !fallback_mode && !portfolio.is_empty() && portfolio_signals.len() == portfolio.len() {
         use rand::SeedableRng;
         use rand::seq::SliceRandom;
         use rayon::prelude::*;
-
-        const ROBUST_WINDOW: usize = 150_000;
-        const N_PERM: usize = 50;
-        const PERM_P_MAX: f64 = 0.05; // real must beat ≥95% of shuffles
-        const PLATEAU_MIN_RATIO: f64 = 0.30;
 
         let n_all = ohlcv.close.len();
         let w0 = n_all.saturating_sub(ROBUST_WINDOW);
@@ -4306,7 +4688,7 @@ where
         let ts_win: &[i64] = if ts_all.len() == n_all { &ts_all[w0..] } else { &[] };
         let eval_cfg_rb = config.evaluation_config(ohlcv.close.last().copied());
 
-        let verdicts: Vec<(bool, String)> = portfolio
+        let verdicts: Vec<(RobustnessGateResult, String)> = portfolio
             .par_iter()
             .enumerate()
             .map(|(gi, gene)| {
@@ -4314,7 +4696,10 @@ where
                     discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
                 let sig_full = &portfolio_signals[gi];
                 if sig_full.len() != n_all {
-                    return (true, "skipped (signal length mismatch)".to_string());
+                    return (
+                        evaluate_robustness_evidence(0.0, 0, None, &[]),
+                        "rejected (signal length mismatch)".to_string(),
+                    );
                 }
                 let sig_win = &sig_full[w0..];
                 let net_of = |sigs: &[i8]| -> f64 {
@@ -4333,27 +4718,32 @@ where
                 let real_net = net_of(sig_win);
                 let signal_bars = sig_win.iter().filter(|s| **s != 0).count();
                 if real_net <= 0.0 || signal_bars < 30 {
-                    // Too little recent evidence to test against — pass through;
-                    // the OOS/PBO gates already judged the full history.
-                    return (true, "skipped (thin recent window)".to_string());
+                    return (
+                        evaluate_robustness_evidence(real_net, signal_bars, None, &[]),
+                        "rejected (thin recent window)".to_string(),
+                    );
                 }
 
                 // #10 permutation p-value — deterministic seed per gene.
                 let seed = 0x4E45_4F45_5448_4F53u64
                     ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-                let mut beats = 0usize;
+                let mut permutation_nets = Vec::with_capacity(N_PERMUTATIONS);
                 let mut shuffled: Vec<i8> = sig_win.to_vec();
-                for _ in 0..N_PERM {
+                for _ in 0..N_PERMUTATIONS {
                     shuffled.shuffle(&mut rng);
-                    if net_of(&shuffled) >= real_net {
-                        beats += 1;
-                    }
+                    permutation_nets.push(net_of(&shuffled));
                 }
-                let p_value = beats as f64 / N_PERM as f64;
-                if p_value >= PERM_P_MAX {
+                let permutation = evaluate_robustness_evidence(
+                    real_net,
+                    signal_bars,
+                    Some(&permutation_nets),
+                    &[],
+                );
+                if !permutation.permutation_passed {
+                    let p_value = permutation.permutation_p_value.unwrap_or(f64::NAN);
                     return (
-                        false,
+                        permutation,
                         format!(
                             "permutation FAIL (p={p_value:.2}: random timing matches the real net)"
                         ),
@@ -4361,73 +4751,120 @@ where
                 }
 
                 // #11 plateau: ±15% threshold perturbations must keep ≥30% net.
+                let mut plateau_variant_nets = Vec::with_capacity(PLATEAU_VARIANT_COUNT);
                 for factor in [0.85_f32, 1.15] {
                     let mut variant = gene.clone();
                     variant.long_threshold *= factor;
                     variant.short_threshold *= factor;
                     let sig_v = signals_for_gene_full(features, ohlcv, &variant, &eval_cfg_rb);
                     if sig_v.len() != n_all {
-                        continue;
-                    }
-                    let net_v = net_of(&sig_v[w0..]);
-                    if net_v < PLATEAU_MIN_RATIO * real_net {
-                        return (
-                            false,
-                            format!(
-                                "plateau FAIL (thresholds ×{factor:.2} → net {net_v:.0} \
-                                 vs real {real_net:.0} — cliff, not plateau)"
-                            ),
-                        );
+                        plateau_variant_nets.push(None);
+                    } else {
+                        plateau_variant_nets.push(Some(net_of(&sig_v[w0..])));
                     }
                 }
-                (true, format!("robust (p={p_value:.2}, plateau ok)"))
+                let result = evaluate_robustness_evidence(
+                    real_net,
+                    signal_bars,
+                    Some(&permutation_nets),
+                    &plateau_variant_nets,
+                );
+                let p_value = result.permutation_p_value.unwrap_or(f64::NAN);
+                let why = if result.plateau_passed {
+                    format!("robust (p={p_value:.2}, plateau ok)")
+                } else {
+                    format!(
+                        "plateau FAIL (minimum ratio {:.2}, required {:.2})",
+                        result.plateau_min_ratio.unwrap_or(f64::NAN),
+                        PLATEAU_MIN_RATIO
+                    )
+                };
+                (result, why)
             })
             .collect();
 
-        for (gi, (kept, why)) in verdicts.iter().enumerate() {
+        for (gi, (verdict, why)) in verdicts.iter().enumerate() {
+            let kept = verdict.permutation_executed
+                && verdict.permutation_passed
+                && verdict.plateau_executed
+                && verdict.plateau_passed;
             tracing::info!(
                 target: "neoethos_search::discovery",
                 gene = %portfolio[gi].strategy_id,
                 kept, reason = %why,
                 "robustness filter verdict"
             );
-        }
-        let keep: Vec<bool> = verdicts.into_iter().map(|(k, _)| k).collect();
-        if keep.iter().any(|k| *k) && !keep.iter().all(|k| *k) {
-            let before = portfolio.len();
-            let mut i = 0usize;
-            portfolio.retain(|_| {
-                let k = keep[i];
-                i += 1;
-                k
-            });
-            let mut i = 0usize;
-            portfolio_signals.retain(|_| {
-                let k = keep[i];
-                i += 1;
-                k
-            });
-            if per_gene_wf.len() == keep.len() {
-                let mut i = 0usize;
-                per_gene_wf.retain(|_| {
-                    let k = keep[i];
-                    i += 1;
-                    k
-                });
+            if let Some(evidence) = validation_gates.strategy_gate_evidence.get_mut(gi) {
+                evidence.permutation_executed = verdict.permutation_executed;
+                evidence.permutation_passed = verdict.permutation_passed;
+                evidence.permutation_p_value = verdict.permutation_p_value;
+                evidence.permutation_samples = verdict.permutation_samples;
+                evidence.plateau_executed = verdict.plateau_executed;
+                evidence.plateau_passed = verdict.plateau_passed;
+                evidence.plateau_min_ratio = verdict.plateau_min_ratio;
+                evidence.plateau_variants = verdict.plateau_variants;
             }
-            tracing::info!(
-                target: "neoethos_search::discovery",
-                kept = portfolio.len(),
-                dropped = before - portfolio.len(),
-                "robustness filters: exporting only the permutation+plateau survivors"
-            );
-        } else if !keep.iter().any(|k| *k) {
-            tracing::warn!(
-                target: "neoethos_search::discovery",
-                "robustness filters would drop EVERY portfolio gene — keeping the \
-                 portfolio (never-zero) but treat these exports with suspicion"
-            );
         }
+        let keep: Vec<bool> = verdicts
+            .iter()
+            .map(|(verdict, _)| {
+                verdict.permutation_executed
+                    && verdict.permutation_passed
+                    && verdict.plateau_executed
+                    && verdict.plateau_passed
+            })
+            .collect();
+        let before = portfolio.len();
+        retain_aligned(&mut portfolio, &keep);
+        retain_aligned(&mut portfolio_signals, &keep);
+        retain_aligned(&mut per_gene_wf, &keep);
+        retain_aligned(&mut canonical_backtest_artifacts, &keep);
+        retain_aligned(&mut walkforward_validation_artifacts, &keep);
+        retain_aligned(&mut validation_gates.strategy_gate_evidence, &keep);
+        validation_gates.canonical_backtest_artifacts = canonical_backtest_artifacts.len();
+        validation_gates.walkforward_validation_artifacts =
+            walkforward_validation_artifacts.len();
+        validation_gates.permutation_executed = !portfolio.is_empty()
+            && validation_gates
+                .strategy_gate_evidence
+                .iter()
+                .all(|evidence| evidence.permutation_executed);
+        validation_gates.permutation_passed = validation_gates.permutation_executed
+            && validation_gates
+                .strategy_gate_evidence
+                .iter()
+                .all(|evidence| evidence.permutation_passed);
+        validation_gates.plateau_executed = !portfolio.is_empty()
+            && validation_gates
+                .strategy_gate_evidence
+                .iter()
+                .all(|evidence| evidence.plateau_executed);
+        validation_gates.plateau_passed = validation_gates.plateau_executed
+            && validation_gates
+                .strategy_gate_evidence
+                .iter()
+                .all(|evidence| evidence.plateau_passed);
+        tracing::info!(
+            target: "neoethos_search::discovery",
+            kept = portfolio.len(),
+            dropped = before - portfolio.len(),
+            "robustness filters: exporting only permutation+plateau survivors"
+        );
+    } else if !fallback_mode && !portfolio.is_empty() {
+        tracing::warn!(
+            target: "neoethos_search::discovery",
+            signals = portfolio_signals.len(),
+            genes = portfolio.len(),
+            "robustness input mismatch — rejecting portfolio"
+        );
+        portfolio.clear();
+        portfolio_signals.clear();
+        per_gene_wf.clear();
+        canonical_backtest_artifacts.clear();
+        walkforward_validation_artifacts.clear();
+        validation_gates.strategy_gate_evidence.clear();
+        validation_gates.canonical_backtest_artifacts = 0;
+        validation_gates.walkforward_validation_artifacts = 0;
     }
 
     // Risky-mode walk-forward FILTER (operator 2026-06-28). The portfolio-level
@@ -4447,12 +4884,15 @@ where
     {
         let keep = per_gene_wf.clone();
         let before = portfolio.len();
-        let mut i = 0usize;
-        portfolio.retain(|_| {
-            let k = keep[i];
-            i += 1;
-            k
-        });
+        retain_aligned(&mut portfolio, &keep);
+        retain_aligned(&mut portfolio_signals, &keep);
+        retain_aligned(&mut per_gene_wf, &keep);
+        retain_aligned(&mut canonical_backtest_artifacts, &keep);
+        retain_aligned(&mut walkforward_validation_artifacts, &keep);
+        retain_aligned(&mut validation_gates.strategy_gate_evidence, &keep);
+        validation_gates.canonical_backtest_artifacts = canonical_backtest_artifacts.len();
+        validation_gates.walkforward_validation_artifacts =
+            walkforward_validation_artifacts.len();
         // Surviving genes each passed walk-forward → the portfolio now does too.
         validation_gates.walkforward_passed = !portfolio.is_empty();
         tracing::info!(
@@ -4463,14 +4903,14 @@ where
         );
     }
 
+    refresh_mandatory_gate_summary(&mut validation_gates);
+
     if let Some(pf) = config.prop_firm_gate.as_ref() {
         // agent 2026-06-05 overfitting fix: the prop-firm window gate alone let
         // in-sample-overfit portfolios export (walk-forward was informational).
         // When `require_walkforward_for_export` is set (default), the portfolio
-        // must ALSO clear the walk-forward gate to be window-passed — so
-        // `is_portfolio_export_ready()` (which keys off `prop_firm_window_passed`)
-        // now demands genuine out-of-sample robustness. When the flag is false
-        // the AND collapses to the previous `!portfolio.is_empty()` behaviour.
+        // must ALSO clear the walk-forward gate to be window-passed. Mandatory
+        // five-gate export validation remains independent of this status.
         let window_passed = !portfolio.is_empty();
         validation_gates.prop_firm_window_passed = if config.require_walkforward_for_export {
             window_passed && validation_gates.walkforward_passed
@@ -4484,15 +4924,10 @@ where
             portfolio_pass_rates.iter().sum::<f64>() / portfolio_pass_rates.len() as f64
         };
     }
-    // 2026-05-26: walkforward + CPCV stages — Strict mode runs these as gates,
-    // PropFirm mode uses them as informational. Either way the funnel records
-    // pass/fail so the operator can see whether a non-empty portfolio later
-    // got dropped at the walkforward stage. The validation_gates bool fields
-    // are the canonical pass/fail signal.
+    // Record mandatory gate outcomes in the funnel for every mode.
     if fallback_mode {
         // Honest: best-effort fallback genes did NOT pass the prop bar, so they
-        // must never read as export-ready downstream (the autonomous trader keys
-        // off `is_portfolio_export_ready()` / `prop_firm_window_passed`).
+        // must never read as prop-firm-ready downstream.
         validation_gates.prop_firm_window_passed = false;
     }
     let portfolio_size = portfolio.len();
@@ -4508,10 +4943,7 @@ where
         0
     };
     funnel.record_stage("passed_cpcv", walkforward_pass, cpcv_pass);
-    // For PropFirm mode the canonical export-ready signal is
-    // `prop_firm_window_passed`; for Strict mode it's both walkforward + cpcv
-    // passed. `is_portfolio_export_ready()` handles both — so the final stage
-    // count is the portfolio size when ready, else 0.
+    // Export-ready requires all five mandatory validation gates in every mode.
     let export_ready = if validation_gates.is_portfolio_export_ready() {
         portfolio_size
     } else {
@@ -4646,15 +5078,71 @@ fn pearson_corr_i8(a: &[i8], b: &[i8]) -> f64 {
 }
 
 pub fn ensure_portfolio_export_ready(result: &DiscoveryResult) -> Result<()> {
-    if result.validation_gates.is_portfolio_export_ready() {
-        return Ok(());
+    let gates = &result.validation_gates;
+    if result.portfolio.is_empty() {
+        anyhow::bail!("Portfolio export requires at least one validated strategy");
     }
-    anyhow::bail!(
-        "Portfolio export requires passing validation gates (walkforward_passed={} cpcv_passed={}). \
-         Lower the walk-forward splits or disable CPCV in config.yaml and re-run.",
-        result.validation_gates.walkforward_passed,
-        result.validation_gates.cpcv_passed
-    );
+    if !gates.is_portfolio_export_ready()
+        || gates.cpcv_fold_count == 0
+        || !gates.cpcv_profitable_fold_ratio.is_finite()
+        || gates.pbo_candidates < MIN_PBO_CANDIDATES
+        || gates.pbo_splits == 0
+        || gates
+            .pbo
+            .map_or(true, |value| {
+                !value.is_finite() || !(0.0..=1.0).contains(&value)
+            })
+    {
+        anyhow::bail!(
+            "Portfolio export requires five executed and passed validation gates \
+             (walkforward={}/{} cpcv={}/{} pbo={}/{} permutation={}/{} plateau={}/{}).",
+            gates.walkforward_executed,
+            gates.walkforward_passed,
+            gates.cpcv_executed,
+            gates.cpcv_passed,
+            gates.pbo_executed,
+            gates.pbo_passed,
+            gates.permutation_executed,
+            gates.permutation_passed,
+            gates.plateau_executed,
+            gates.plateau_passed,
+        );
+    }
+    if gates.strategy_gate_evidence.len() != result.portfolio.len() {
+        anyhow::bail!(
+            "Portfolio export requires one validation-evidence record per strategy \
+             (portfolio={} evidence={})",
+            result.portfolio.len(),
+            gates.strategy_gate_evidence.len()
+        );
+    }
+    let mut matched_hashes = HashSet::with_capacity(result.portfolio.len());
+    for gene in &result.portfolio {
+        let strategy_hash = stable_json_hash(gene)?;
+        let mut matches = gates
+            .strategy_gate_evidence
+            .iter()
+            .filter(|evidence| evidence.strategy_hash == strategy_hash);
+        let Some(evidence) = matches.next() else {
+            anyhow::bail!(
+                "Portfolio export missing validation evidence for strategy {}",
+                gene.strategy_id
+            );
+        };
+        if matches.next().is_some() || !matched_hashes.insert(strategy_hash) {
+            anyhow::bail!(
+                "Portfolio export has duplicate validation evidence for strategy {}",
+                gene.strategy_id
+            );
+        }
+        if !evidence.is_export_ready() {
+            anyhow::bail!(
+                "Portfolio export has incomplete or failed validation evidence for strategy {}",
+                gene.strategy_id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn build_portfolio_exports<'a>(
@@ -5190,6 +5678,7 @@ pub fn build_discovery_profile(
         cpcv_embargo_pct: config.cpcv_embargo_pct,
         cpcv_purge_pct: config.cpcv_purge_pct,
         cpcv_min_phi: config.cpcv_min_phi,
+        max_pbo: config.max_pbo,
         filters: DiscoveryFilterProfile {
             max_dd: config.filtering.max_dd,
             min_profit: config.filtering.min_profit,
@@ -5213,6 +5702,7 @@ pub fn build_discovery_profile(
         portfolio_observed: result.portfolio.len(),
         quality_metrics_observed: result.quality_metrics.len(),
         logged_trade_sets: result.logged_trades.len(),
+        validation_gates: result.validation_gates.clone(),
         walkforward_passed: result.validation_gates.walkforward_passed,
         cpcv_passed: result.validation_gates.cpcv_passed,
         canonical_backtest_artifacts_observed: result.validation_gates.canonical_backtest_artifacts,

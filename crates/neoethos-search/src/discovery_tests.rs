@@ -44,6 +44,40 @@ fn profitable_gene(strategy_id: &str) -> Gene {
     }
 }
 
+fn mark_all_mandatory_gates_passed(result: &mut DiscoveryResult) {
+    let evidence = result
+        .portfolio
+        .iter()
+        .map(|gene| StrategyGateEvidence {
+            strategy_hash: stable_json_hash(gene).expect("strategy hash"),
+            walkforward_executed: true,
+            walkforward_passed: true,
+            walkforward_splits: 1,
+            cpcv_executed: true,
+            cpcv_passed: true,
+            cpcv_fold_count: 1,
+            cpcv_profitable_fold_ratio: 1.0,
+            cpcv_min_phi: 0.80,
+            pbo_executed: true,
+            pbo_passed: true,
+            pbo: Some(0.1),
+            pbo_max: 0.5,
+            pbo_candidates: MIN_PBO_CANDIDATES,
+            pbo_splits: 1,
+            permutation_executed: true,
+            permutation_passed: true,
+            permutation_p_value: Some(0.0),
+            permutation_samples: N_PERMUTATIONS,
+            plateau_executed: true,
+            plateau_passed: true,
+            plateau_min_ratio: Some(0.5),
+            plateau_variants: PLATEAU_VARIANT_COUNT,
+        })
+        .collect();
+    result.validation_gates.strategy_gate_evidence = evidence;
+    refresh_mandatory_gate_summary(&mut result.validation_gates);
+}
+
 fn temp_path(name: &str) -> std::path::PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -215,7 +249,7 @@ fn portfolio_export_requires_validation_gates() {
 
     let err = save_portfolio_json(&path, &result)
         .expect_err("portfolio export must fail before validation gates pass");
-    assert!(err.to_string().contains("walkforward_passed"));
+    assert!(err.to_string().contains("five executed and passed"));
     assert!(!path.exists());
 }
 
@@ -245,8 +279,162 @@ fn portfolio_export_blocked_when_only_prop_firm_window_passed() {
 
     let err = save_portfolio_json(&path, &result)
         .expect_err("prop-firm window alone must NOT unlock export (mandatory OOS)");
-    assert!(err.to_string().contains("walkforward_passed"));
+    assert!(err.to_string().contains("five executed and passed"));
     assert!(!path.exists());
+}
+
+#[test]
+fn cpcv_disabled_is_not_executed_or_passed() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let portfolio = vec![profitable_gene("alpha-1")];
+    let signals = vec![vec![0; ohlcv.close.len()]];
+    let (months, days) = month_day_indices(&features.timestamps);
+    let config = DiscoveryConfig {
+        enable_cpcv: false,
+        ..DiscoveryConfig::default()
+    };
+
+    let gate = evaluate_cpcv_gate(
+        &portfolio,
+        &signals,
+        &features,
+        &ohlcv,
+        &config,
+        &months,
+        &days,
+        &portfolio,
+    )
+    .expect("disabled CPCV should return explicit failed status");
+
+    assert!(!gate.executed);
+    assert!(!gate.passed);
+    assert!(!gate.pbo_executed);
+    assert!(!gate.pbo_passed);
+}
+
+#[test]
+fn cpcv_zero_splits_is_not_executed_or_passed() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let portfolio = vec![profitable_gene("alpha-1")];
+    let signals = vec![vec![0; ohlcv.close.len()]];
+    let (months, days) = month_day_indices(&features.timestamps);
+    let config = DiscoveryConfig {
+        cpcv_n_splits: 1,
+        ..DiscoveryConfig::default()
+    };
+
+    let gate = evaluate_cpcv_gate(
+        &portfolio,
+        &signals,
+        &features,
+        &ohlcv,
+        &config,
+        &months,
+        &days,
+        &portfolio,
+    )
+    .expect("zero CPCV splits should return explicit failed status");
+
+    assert!(!gate.executed);
+    assert!(!gate.passed);
+    assert_eq!(gate.fold_count, 0);
+}
+
+#[test]
+fn mode_overrides_preserve_nonzero_cpcv_threshold() {
+    for mode in [DiscoveryMode::PropFirm, DiscoveryMode::Risky] {
+        let config = DiscoveryConfig {
+            mode,
+            ..DiscoveryConfig::default()
+        }
+        .apply_mode_overrides();
+        assert_eq!(config.cpcv_min_phi, 0.80);
+        let zero_quality = cpcv_gene_gate_result(10, 0, true, config.cpcv_min_phi);
+        assert!(zero_quality.executed);
+        assert!(!zero_quality.passed);
+    }
+}
+
+#[test]
+fn pbo_requires_minimum_candidate_count() {
+    let (executed, passed) = pbo_gate_status(Some(0.1), 0.5, MIN_PBO_CANDIDATES - 1, 3);
+    assert!(!executed);
+    assert!(!passed);
+}
+
+#[test]
+fn pbo_non_finite_values_fail_closed() {
+    for pbo in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let (executed, passed) =
+            pbo_gate_status(Some(pbo), 0.5, MIN_PBO_CANDIDATES, 3);
+        assert!(!executed);
+        assert!(!passed);
+    }
+    let (executed, passed) =
+        pbo_gate_status(Some(0.1), 0.0, MIN_PBO_CANDIDATES, 3);
+    assert!(!executed);
+    assert!(!passed);
+}
+
+#[test]
+fn permutation_thin_data_fails_closed() {
+    let result = evaluate_robustness_evidence(100.0, 29, None, &[]);
+    assert!(!result.permutation_executed);
+    assert!(!result.permutation_passed);
+}
+
+#[test]
+fn permutation_signal_mismatch_fails_closed() {
+    let result = evaluate_robustness_evidence(100.0, 30, None, &[]);
+    assert!(!result.permutation_executed);
+    assert!(!result.permutation_passed);
+}
+
+#[test]
+fn plateau_requires_both_finite_variants() {
+    let permutation_nets = vec![0.0; N_PERMUTATIONS];
+    let result = evaluate_robustness_evidence(
+        100.0,
+        30,
+        Some(&permutation_nets),
+        &[Some(50.0), None],
+    );
+    assert!(result.permutation_passed);
+    assert!(!result.plateau_executed);
+    assert!(!result.plateau_passed);
+}
+
+#[test]
+fn all_robustness_failures_leave_empty_portfolio() {
+    let mut portfolio = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];
+    retain_aligned(&mut portfolio, &[false, false]);
+    assert!(portfolio.is_empty());
+}
+
+#[test]
+fn portfolio_export_rejects_four_of_five_gates() {
+    let mut result = DiscoveryResult {
+        portfolio: vec![profitable_gene("alpha-1")],
+        candidates: Vec::new(),
+        quality_metrics: Vec::new(),
+        logged_trades: Vec::new(),
+        effective_feature_names: vec!["signal".to_string()],
+        validation_gates: DiscoveryValidationGates::pending(),
+        canonical_backtest_artifacts: Vec::new(),
+        walkforward_validation_artifacts: Vec::new(),
+        forward_test_validation_artifacts: Vec::new(),
+        prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
+    };
+    mark_all_mandatory_gates_passed(&mut result);
+    result.validation_gates.strategy_gate_evidence[0].plateau_passed = false;
+    refresh_mandatory_gate_summary(&mut result.validation_gates);
+
+    let err = ensure_portfolio_export_ready(&result)
+        .expect_err("four of five mandatory gates must not export");
+    assert!(err.to_string().contains("plateau=true/false"));
 }
 
 #[test]
@@ -361,8 +549,7 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
         prop_firm_validation_artifacts: Vec::new(),
         funnel_profile: None,
     };
-    result.validation_gates.walkforward_passed = true;
-    result.validation_gates.cpcv_passed = true;
+    mark_all_mandatory_gates_passed(&mut result);
     let path = temp_path("portfolio-export");
 
     save_portfolio_json(&path, &result)
@@ -403,6 +590,50 @@ fn discovery_profile_exports_validation_gate_status() {
     assert_eq!(profile.walkforward_validation_artifacts_observed, 1);
     assert_eq!(profile.cpcv_fold_count, 3);
     assert_eq!(profile.cpcv_profitable_fold_ratio, 1.0);
+}
+
+#[test]
+fn persisted_profile_contains_all_five_gate_evidence() {
+    let mut result = DiscoveryResult {
+        portfolio: vec![profitable_gene("alpha-1")],
+        candidates: vec![profitable_gene("alpha-1")],
+        quality_metrics: Vec::new(),
+        logged_trades: Vec::new(),
+        effective_feature_names: vec!["signal".to_string()],
+        validation_gates: DiscoveryValidationGates::pending(),
+        canonical_backtest_artifacts: Vec::new(),
+        walkforward_validation_artifacts: Vec::new(),
+        forward_test_validation_artifacts: Vec::new(),
+        prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
+    };
+    mark_all_mandatory_gates_passed(&mut result);
+    let path = temp_path("complete-gate-evidence");
+
+    save_discovery_profile_json(&path, &DiscoveryConfig::default(), &result)
+        .expect("profile should persist complete validation evidence");
+    let value: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).expect("profile should be readable"),
+    )
+    .expect("profile should be valid JSON");
+    let gates = &value["validation_gates"];
+    for gate in [
+        "walkforward_executed",
+        "cpcv_executed",
+        "pbo_executed",
+        "permutation_executed",
+        "plateau_executed",
+    ] {
+        assert_eq!(gates[gate], true, "missing or false {gate}");
+    }
+    assert_eq!(gates["strategy_gate_evidence"].as_array().unwrap().len(), 1);
+    let expected_hash = stable_json_hash(&result.portfolio[0]).expect("strategy hash");
+    assert_eq!(
+        gates["strategy_gate_evidence"][0]["strategy_hash"].as_str(),
+        Some(expected_hash.as_str())
+    );
+
+    let _ = std::fs::remove_file(path);
 }
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
