@@ -1307,7 +1307,7 @@ fn discovery_backtest_settings(
         spread_pips: evaluation.spread_pips,
         commission_per_trade: evaluation.commission_per_trade,
         pip_value_per_lot: evaluation.pip_value_per_lot,
-        kill_zones_enabled: true,
+        kill_zones_enabled: false,
         ..crate::eval::BacktestSettings::default()
     }
 }

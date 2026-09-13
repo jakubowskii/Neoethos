@@ -26,6 +26,68 @@ fn sample_ohlcv() -> Ohlcv {
     neoethos_data::test_fixtures::ctrader_sample_ohlcv()
 }
 
+#[test]
+fn discovery_settings_disable_kill_zones_for_canonical_wfo_parity() {
+    let config = DiscoveryConfig::default();
+    let gene = Gene::default();
+    let mut settings = discovery_backtest_settings(&config, &gene, Some(100.0));
+    assert!(!settings.kill_zones_enabled);
+
+    settings.sl_pips = 1_000_000.0;
+    settings.tp_pips = 1_000_000.0;
+    settings.max_hold_bars = 1;
+    settings.min_hold_bars = 1;
+    settings.spread_pips = 0.0;
+    settings.commission_per_trade = 0.0;
+    settings.risk_based_sizing = false;
+
+    for entry_timestamp in [1_704_068_100_000, 1_704_484_800_000] {
+        let close = [100.0, 100.0, 101.0];
+        let signals = [1, 0, 0];
+        let timestamps = [
+            entry_timestamp - 3_600_000,
+            entry_timestamp,
+            entry_timestamp + 3_600_000,
+        ];
+        let months = [2024 * 12 + 1; 3];
+        let days = [20240101; 3];
+        let canonical = fast_evaluate_strategy_core(
+            &close,
+            &close,
+            &close,
+            &signals,
+            &[],
+            &months,
+            &days,
+            &timestamps,
+            &settings,
+        );
+        let trades = simulate_trades_core(
+            &close,
+            &close,
+            &close,
+            &timestamps,
+            &signals,
+            &settings,
+        );
+
+        assert_eq!(canonical[8], 1.0);
+        assert_eq!(trades.len(), 1);
+
+        let mut kill_zones_enabled = settings.clone();
+        kill_zones_enabled.kill_zones_enabled = true;
+        assert!(simulate_trades_core(
+            &close,
+            &close,
+            &close,
+            &timestamps,
+            &signals,
+            &kill_zones_enabled,
+        )
+        .is_empty());
+    }
+}
+
 fn profitable_gene(strategy_id: &str) -> Gene {
     Gene {
         strategy_id: strategy_id.to_string(),

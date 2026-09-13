@@ -923,8 +923,16 @@ fn walkforward_risk_diagnostics(
     max_trades_per_day: usize,
     initial_balance: f64,
 ) -> Result<WalkforwardRiskDiagnostics> {
-    if close.is_empty() || days.is_empty() {
-        return Ok(WalkforwardRiskDiagnostics::default());
+    let n = close.len();
+    if n == 0
+        || high.len() != n
+        || low.len() != n
+        || signals.len() != n
+        || confidences.len() != n
+        || days.len() != n
+        || timestamps.len() != n
+    {
+        bail!("empty data or length mismatch in walk-forward risk diagnostics");
     }
     let initial_balance = if initial_balance.is_finite() && initial_balance > 0.0 {
         initial_balance
@@ -944,17 +952,16 @@ fn walkforward_risk_diagnostics(
         });
     }
 
-    // Use real timestamps so simulate_trades_core applies correct gap/session/kill-zone logic.
-    let ts = if timestamps.len() == close.len() {
-        timestamps
-    } else {
-        days
-    };
+    let timestamp_days: BTreeMap<i64, i64> = timestamps
+        .iter()
+        .copied()
+        .zip(days.iter().copied())
+        .collect();
     let trades = simulate_trades_core_with_confidence(
         close,
         high,
         low,
-        ts,
+        timestamps,
         signals,
         confidences,
         settings,
@@ -970,15 +977,12 @@ fn walkforward_risk_diagnostics(
             current_consec_losses = 0;
         }
 
-        let exit_day = trade.exit_time.unwrap_or(trade.entry_time);
-        let offset = if let Some(&offset) = day_offsets.get(&exit_day) {
-            offset
-        } else {
-            let offset = daily_pnl.len();
-            day_offsets.insert(exit_day, offset);
-            daily_pnl.push(0.0);
-            daily_trade_counts.push(0);
-            offset
+        let exit_timestamp = trade.exit_time.unwrap_or(trade.entry_time);
+        let Some(exit_day) = timestamp_days.get(&exit_timestamp) else {
+            bail!("trade exit timestamp is not aligned to a walk-forward bar");
+        };
+        let Some(&offset) = day_offsets.get(exit_day) else {
+            bail!("trade exit day is not aligned to walk-forward day keys");
         };
         daily_pnl[offset] += trade.pnl;
         daily_trade_counts[offset] += 1;
@@ -1071,6 +1075,7 @@ pub fn embargoed_walkforward_backtest(
         || confidences.len() != n
         || months.len() != n
         || days.len() != n
+        || timestamps.len() != n
     {
         bail!("empty data or length mismatch");
     }
@@ -1135,11 +1140,7 @@ pub fn embargoed_walkforward_backtest(
                 let slice_conf = &confidences[test_start..end];
                 let slice_months = &months[test_start..end];
                 let slice_days = &days[test_start..end];
-                let slice_ts = if timestamps.len() == n {
-                    &timestamps[test_start..end]
-                } else {
-                    slice_days
-                };
+                let slice_ts = &timestamps[test_start..end];
 
                 let metrics = fast_evaluate_strategy_core(
                     slice_close,
@@ -1369,7 +1370,13 @@ where
 
     let n = close.len();
     let n_genes = signals_per_gene.len();
-    if n == 0 || high.len() != n || low.len() != n || months.len() != n || days.len() != n {
+    if n == 0
+        || high.len() != n
+        || low.len() != n
+        || months.len() != n
+        || days.len() != n
+        || timestamps.len() != n
+    {
         bail!("empty data or length mismatch");
     }
     if gene_settings.len() != n_genes {
@@ -1477,11 +1484,7 @@ where
         let slice_high = &high[test_start..end];
         let slice_low = &low[test_start..end];
         let slice_days = &days[test_start..end];
-        let slice_ts = if timestamps.len() == n {
-            &timestamps[test_start..end]
-        } else {
-            slice_days
-        };
+        let slice_ts = &timestamps[test_start..end];
 
         // ── CPU half (per gene): risk diagnostics on the sliced precomputed
         //    signals — IDENTICAL to the single-gene path. ────────────────────
@@ -1734,12 +1737,21 @@ mod tests {
 
     #[test]
     fn risk_diagnostics_enforce_prop_constraints_from_simulated_trades() {
-        let close = [100.0, 101.0, 103.0, 102.0, 100.0, 99.0, 98.0];
+        let close = [100.0, 100.0, 99.0, 100.0, 99.0, 100.0, 101.0];
         let high = close;
         let low = close;
         let signals = [1, 0, 1, 0, 1, 0, 0];
         let confidences = [1.0_f32; 7];
-        let days = [1, 1, 1, 2, 2, 2, 2];
+        let days = [20240101, 20240101, 20240101, 20240101, 20240101, 20240102, 20240102];
+        let timestamps = [
+            1_704_067_200_000,
+            1_704_070_800_000,
+            1_704_074_400_000,
+            1_704_078_000_000,
+            1_704_081_600_000,
+            1_704_153_600_000,
+            1_704_157_200_000,
+        ];
 
         let risk = walkforward_risk_diagnostics(
             &close,
@@ -1748,10 +1760,10 @@ mod tests {
             &signals,
             &confidences,
             &days,
-            &days,
+            &timestamps,
             &flat_settings(),
             0.0,
-            0.01,
+            0.15,
             0.50,
             3,
             1,
@@ -1766,6 +1778,37 @@ mod tests {
         assert!(!risk.min_trading_days_ok);
         assert!(!risk.prop_compliant);
         assert_eq!(risk.daily_returns.len(), 2);
+        assert!((risk.daily_returns[0] + 0.20).abs() < 1e-12);
+        assert!((risk.daily_returns[1] - 0.10).abs() < 1e-12);
+        assert!((risk.max_daily_loss - 0.20).abs() < 1e-12);
+    }
+
+    #[test]
+    fn risk_diagnostics_reject_mismatched_timestamps() {
+        let bars = [100.0, 100.0];
+        let signals = [1, 0];
+        let confidences = [1.0_f32; 2];
+        let days = [20240101, 20240101];
+
+        let err = walkforward_risk_diagnostics(
+            &bars,
+            &bars,
+            &bars,
+            &signals,
+            &confidences,
+            &days,
+            &[1_704_067_200_000],
+            &flat_settings(),
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            100_000.0,
+        )
+        .expect_err("mismatched timestamps must fail closed");
+
+        assert!(err.to_string().contains("length mismatch"));
     }
 
     #[test]
