@@ -1,6 +1,8 @@
 use crate::artifact_io::{stable_json_hash, write_json_atomic};
 use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core};
-use crate::genetic::strategy_gene::EvaluationConfig;
+use crate::genetic::strategy_gene::{
+    EvaluationConfig, MarketCostProfile, resolve_strict_discovery_cost_profile,
+};
 use crate::genetic::{
     Gene, build_smc_arrays, evolve_search_with_progress_and_limits, month_day_indices,
     signals_and_confidence_for_gene_full, signals_for_gene_full,
@@ -230,8 +232,11 @@ pub struct DiscoveryConfig {
     pub timeframe_label: String,
     pub evaluation_symbol: String,
     pub evaluation_account_currency: String,
-    pub evaluation_spread_pips: f64,
-    pub evaluation_commission_per_trade: f64,
+    pub evaluation_spread_pips: Option<f64>,
+    pub evaluation_commission_per_trade: Option<f64>,
+    pub evaluation_quote_to_account_rate: Option<f64>,
+    pub evaluation_slippage_pips: f64,
+    pub resolved_market_cost_profile: Option<MarketCostProfile>,
     pub population: usize,
     pub generations: usize,
     pub max_indicators: usize,
@@ -359,8 +364,11 @@ impl Default for DiscoveryConfig {
             // callers MUST set these explicitly before run.
             evaluation_symbol: String::new(),
             evaluation_account_currency: String::new(),
-            evaluation_spread_pips: f64::NAN,
-            evaluation_commission_per_trade: f64::NAN,
+            evaluation_spread_pips: None,
+            evaluation_commission_per_trade: None,
+            evaluation_quote_to_account_rate: None,
+            evaluation_slippage_pips: 0.0,
+            resolved_market_cost_profile: None,
             population: 1000,
             generations: 10,
             max_indicators: 5,
@@ -474,15 +482,13 @@ impl DiscoveryConfig {
             // making *every* `from_settings` call fall into the NaN trap
             // even when the operator had set the value — root cause #304.
             evaluation_account_currency: settings.system.account_currency.clone(),
-            // Honest-costs fix (2026-07-02): `risk.slippage_pips` existed (and
-            // the live order-cost helper charged it) but the DISCOVERY
-            // evaluator ignored it — strategies were validated against costs
-            // the live fills never see. Fold slippage into the effective
-            // spread HERE (single resolution point) so the CPU and GPU
-            // kernels charge it identically with zero kernel changes.
-            evaluation_spread_pips: settings.risk.backtest_spread_pips.max(0.0)
-                + settings.risk.slippage_pips.max(0.0),
-            evaluation_commission_per_trade: settings.risk.commission_per_lot.max(0.0),
+            evaluation_spread_pips: model_settings.eval_runtime.spread_pips,
+            evaluation_commission_per_trade: model_settings
+                .eval_runtime
+                .commission_per_trade,
+            evaluation_quote_to_account_rate: model_settings.eval_runtime.quote_to_account_rate,
+            evaluation_slippage_pips: settings.risk.slippage_pips,
+            resolved_market_cost_profile: None,
             population: model_settings.prop_search_population.max(10),
             generations: model_settings.prop_search_generations.max(1),
             // P2 fix: `0` now means "use ALL available enabled features"
@@ -722,13 +728,16 @@ impl DiscoveryConfig {
     }
 
     pub fn evaluation_config(&self, price_hint: Option<f64>) -> EvaluationConfig {
-        let mut cfg = EvaluationConfig::for_symbol(
-            &self.evaluation_symbol,
-            &self.evaluation_account_currency,
-            price_hint,
-            Some(self.evaluation_spread_pips),
-            Some(self.evaluation_commission_per_trade),
-        );
+        let mut cfg = match &self.resolved_market_cost_profile {
+            Some(profile) => EvaluationConfig::from_market_cost_profile(profile.clone()),
+            None => EvaluationConfig::for_symbol(
+                &self.evaluation_symbol,
+                &self.evaluation_account_currency,
+                price_hint,
+                self.evaluation_spread_pips,
+                self.evaluation_commission_per_trade,
+            ),
+        };
         // scoring_version 5: Risky discovery evolves under the Kelly
         // log-growth objective — the SAME math its post-GA ranking
         // (`calculate_income_score`) scores with, so the population the
@@ -1307,6 +1316,9 @@ fn discovery_backtest_settings(
         spread_pips: evaluation.spread_pips,
         commission_per_trade: evaluation.commission_per_trade,
         pip_value_per_lot: evaluation.pip_value_per_lot,
+        swap_long_pips_per_day: evaluation.swap_long_pips_per_day,
+        swap_short_pips_per_day: evaluation.swap_short_pips_per_day,
+        pnl_conversion_fee_rate: evaluation.pnl_conversion_fee_rate,
         kill_zones_enabled: false,
         ..crate::eval::BacktestSettings::default()
     }
@@ -2973,27 +2985,18 @@ where
              ends up with 0 trades and the operator sees no diagnostic."
         );
     }
-    if !config.evaluation_spread_pips.is_finite() {
-        anyhow::bail!(
-            "run_discovery_cycle: DiscoveryConfig.evaluation_spread_pips is \
-             non-finite ({}). Set settings.risk.backtest_spread_pips in \
-             config.yaml (typical: 0.5–2.0 for FX, 2.5–8.0 for indices/\
-             commodities; live spread varies — pick a backtest-conservative \
-             value).",
-            config.evaluation_spread_pips
-        );
-    }
-    if !config.evaluation_commission_per_trade.is_finite() {
-        anyhow::bail!(
-            "run_discovery_cycle: DiscoveryConfig.evaluation_commission_per_trade \
-             is non-finite ({}). Set settings.risk.commission_per_lot in \
-             config.yaml. (D.2e wire-up now derives this from the broker's \
-             commission_type+rate when SymbolMetadata is populated — but \
-             the default-NaN sentinel still needs a real number for fully \
-             standalone runs without a broker session.)",
-            config.evaluation_commission_per_trade
-        );
-    }
+    let strict_profile = resolve_strict_discovery_cost_profile(
+        &config.evaluation_symbol,
+        &config.evaluation_account_currency,
+        config.evaluation_spread_pips,
+        config.evaluation_commission_per_trade,
+        config.evaluation_quote_to_account_rate,
+        ohlcv.close.last().copied(),
+        config.evaluation_slippage_pips,
+    )?;
+    let mut effective_config = config.clone();
+    effective_config.resolved_market_cost_profile = Some(strict_profile);
+    let config = &effective_config;
 
     // Never-OOM auto-tune (2026-06-08): probe host RAM + GPU VRAM ONCE and
     // install memory budgets sized to the detected hardware, so peak memory

@@ -1,4 +1,5 @@
 use super::runtime_overrides::current_strategy_evaluation_runtime_overrides;
+use anyhow::{Result, bail};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -513,6 +514,167 @@ pub fn infer_market_cost_profile(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_strict_discovery_cost_profile_from_metadata(
+    symbol: &str,
+    account_currency: &str,
+    metadata: Option<&neoethos_core::symbol_metadata::SymbolMetadata>,
+    spread_override: Option<f64>,
+    commission_override: Option<f64>,
+    quote_to_account_rate: Option<f64>,
+    price_hint: Option<f64>,
+    slippage_pips: f64,
+) -> Result<MarketCostProfile> {
+    let symbol = normalized_symbol(symbol);
+    let account_currency = account_currency.trim().to_ascii_uppercase();
+    if symbol.is_empty() || account_currency.is_empty() {
+        bail!("strict Discovery requires symbol and account currency");
+    }
+    let metadata = metadata
+        .ok_or_else(|| anyhow::anyhow!("missing broker SymbolMetadata for {symbol}"))?;
+    if normalized_symbol(&metadata.symbol) != symbol {
+        bail!("broker SymbolMetadata symbol does not match {symbol}");
+    }
+    for (name, value) in [
+        ("pip_size", metadata.pip_size),
+        ("contract_size", metadata.contract_size),
+        ("pip_value_quote", metadata.pip_value_quote),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            bail!("invalid broker {name} for {symbol}");
+        }
+    }
+    if !slippage_pips.is_finite() || slippage_pips < 0.0 {
+        bail!("invalid configured slippage for {symbol}");
+    }
+    let market_spread = match spread_override {
+        Some(value) if value.is_finite() && value >= 0.0 => value,
+        Some(_) => bail!("invalid explicit Discovery spread override for {symbol}"),
+        None => metadata
+            .typical_spread_pips
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| anyhow::anyhow!("missing broker spread for {symbol}"))?,
+    };
+    let spread_pips = market_spread + slippage_pips;
+    if !spread_pips.is_finite() {
+        bail!("invalid effective spread for {symbol}");
+    }
+
+    let quote = metadata.quote.trim().to_ascii_uppercase();
+    let base = metadata.base.trim().to_ascii_uppercase();
+    if quote.is_empty() || base.is_empty() {
+        bail!("missing broker base/quote currency for {symbol}");
+    }
+    let quote_to_account_rate = match quote_to_account_rate {
+        Some(value) if value.is_finite() && value > 0.0 => Some(value),
+        Some(_) => bail!("invalid quote→account conversion rate for {symbol}"),
+        None if quote != account_currency && base != account_currency => {
+            bail!("missing quote→account conversion rate for {symbol}")
+        }
+        None => None,
+    };
+    let price_hint = price_hint.filter(|value| value.is_finite() && *value > 0.0);
+    if base == account_currency && price_hint.is_none() {
+        bail!("missing valid price hint for base-currency pair {symbol}");
+    }
+    let effective_quote_to_account_rate = if quote == account_currency {
+        Some(1.0)
+    } else if base == account_currency {
+        price_hint.map(|price| 1.0 / price)
+    } else {
+        quote_to_account_rate
+    };
+    let pip_value_per_lot = metadata.pip_value_in_account(
+        &account_currency,
+        effective_quote_to_account_rate,
+        price_hint,
+    );
+    if !pip_value_per_lot.is_finite() || pip_value_per_lot <= 0.0 {
+        bail!("invalid pip value per lot for {symbol}");
+    }
+
+    let commission_per_trade = match commission_override {
+        Some(value) if value.is_finite() && value >= 0.0 => value,
+        Some(_) => bail!("invalid explicit Discovery commission override for {symbol}"),
+        None => metadata
+            .commission_per_lot
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .and_then(|value| {
+                effective_quote_to_account_rate.map(|rate| value * rate)
+            })
+            .or_else(|| {
+                let usd_to_account_rate = if account_currency == "USD" {
+                    None
+                } else if quote == "USD" {
+                    effective_quote_to_account_rate
+                } else if base == "USD" {
+                    price_hint
+                        .zip(effective_quote_to_account_rate)
+                        .map(|(price, rate)| price * rate)
+                } else {
+                    None
+                };
+                metadata.commission_per_lot_account_ccy_v2(
+                    &account_currency,
+                    price_hint,
+                    effective_quote_to_account_rate,
+                    usd_to_account_rate,
+                )
+            })
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| anyhow::anyhow!("missing or invalid commission truth for {symbol}"))?,
+    };
+    let swap_long_pips_per_day = metadata
+        .daily_swap_long_pips
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow::anyhow!("missing swap_long for {symbol}"))?;
+    let swap_short_pips_per_day = metadata
+        .daily_swap_short_pips
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow::anyhow!("missing swap_short for {symbol}"))?;
+    let pnl_conversion_fee_rate = match metadata.pnl_conversion_fee_rate {
+        Some(value) if value.is_finite() && (0.0..1.0).contains(&value) => value,
+        Some(_) => bail!("invalid PnL conversion fee for {symbol}"),
+        None if quote == account_currency => 0.0,
+        None => bail!("missing PnL conversion fee for {symbol}"),
+    };
+
+    Ok(MarketCostProfile {
+        symbol,
+        account_currency,
+        pip_value: metadata.pip_size,
+        pip_value_per_lot,
+        spread_pips,
+        commission_per_trade,
+        swap_long_pips_per_day,
+        swap_short_pips_per_day,
+        pnl_conversion_fee_rate,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_strict_discovery_cost_profile(
+    symbol: &str,
+    account_currency: &str,
+    spread_override: Option<f64>,
+    commission_override: Option<f64>,
+    quote_to_account_rate: Option<f64>,
+    price_hint: Option<f64>,
+    slippage_pips: f64,
+) -> Result<MarketCostProfile> {
+    let metadata = neoethos_core::symbol_metadata::resolve(symbol);
+    resolve_strict_discovery_cost_profile_from_metadata(
+        symbol,
+        account_currency,
+        metadata.as_ref(),
+        spread_override,
+        commission_override,
+        quote_to_account_rate,
+        price_hint,
+        slippage_pips,
+    )
+}
+
 impl Gene {
     pub fn is_anomalous(&self) -> bool {
         let trades = self.trades_count as f64;
@@ -686,6 +848,9 @@ pub struct EvaluationConfig {
     pub spread_pips: f64,
     pub commission_per_trade: f64,
     pub pip_value_per_lot: f64,
+    pub swap_long_pips_per_day: f64,
+    pub swap_short_pips_per_day: f64,
+    pub pnl_conversion_fee_rate: f64,
     pub smc_gate_threshold: f32,
     pub smc_weight_ob: f32,
     pub smc_weight_fvg: f32,
@@ -729,6 +894,9 @@ impl Default for EvaluationConfig {
             spread_pips: f64::NAN,
             commission_per_trade: f64::NAN,
             pip_value_per_lot: f64::NAN,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
             smc_gate_threshold: smc.gate_threshold,
             smc_weight_ob: smc.w_ob,
             smc_weight_fvg: smc.w_fvg,
@@ -761,6 +929,10 @@ impl EvaluationConfig {
             spread_pips_override,
             commission_override,
         );
+        Self::from_market_cost_profile(profile)
+    }
+
+    pub fn from_market_cost_profile(profile: MarketCostProfile) -> Self {
         Self {
             symbol: profile.symbol,
             account_currency: profile.account_currency,
@@ -768,6 +940,9 @@ impl EvaluationConfig {
             pip_value_per_lot: profile.pip_value_per_lot,
             spread_pips: profile.spread_pips,
             commission_per_trade: profile.commission_per_trade,
+            swap_long_pips_per_day: profile.swap_long_pips_per_day,
+            swap_short_pips_per_day: profile.swap_short_pips_per_day,
+            pnl_conversion_fee_rate: profile.pnl_conversion_fee_rate,
             // 2026-06-06 operator mandate: break-even + trailing is ALWAYS ON in
             // discovery (HARDCODED here — the production EvaluationConfig builder).
             // Both the GA eval (search_engine `b_settings`) and the funnel/prop-firm
@@ -790,6 +965,53 @@ impl EvaluationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strict_metadata(
+        symbol: &str,
+        base: &str,
+        quote: &str,
+    ) -> neoethos_core::symbol_metadata::SymbolMetadata {
+        neoethos_core::symbol_metadata::SymbolMetadata {
+            symbol: symbol.to_string(),
+            base: base.to_string(),
+            quote: quote.to_string(),
+            pip_size: 0.0001,
+            contract_size: 100_000.0,
+            pip_value_quote: 10.0,
+            digits: 5,
+            min_lot: 0.01,
+            max_lot: 100.0,
+            lot_step: 0.01,
+            typical_price: Some(1.1),
+            typical_spread_pips: Some(1.2),
+            commission_per_lot: Some(6.0),
+            daily_swap_long_pips: Some(0.0),
+            daily_swap_short_pips: Some(0.0),
+            pnl_conversion_fee_rate: None,
+            commission_type: None,
+            commission_rate_decimal: None,
+        }
+    }
+
+    fn strict_profile(
+        metadata: Option<&neoethos_core::symbol_metadata::SymbolMetadata>,
+        account_currency: &str,
+        spread: Option<f64>,
+        commission: Option<f64>,
+        quote_rate: Option<f64>,
+        slippage: f64,
+    ) -> Result<MarketCostProfile> {
+        resolve_strict_discovery_cost_profile_from_metadata(
+            "EURUSD",
+            account_currency,
+            metadata,
+            spread,
+            commission,
+            quote_rate,
+            Some(1.1),
+            slippage,
+        )
+    }
 
     #[test]
     fn normalize_canonicalizes_duplicate_indicator_terms() {
@@ -849,6 +1071,198 @@ mod tests {
         assert_eq!(profile.swap_long_pips_per_day, 0.0);
         assert_eq!(profile.swap_short_pips_per_day, 0.0);
         assert_eq!(profile.pnl_conversion_fee_rate, 0.0);
+    }
+
+    #[test]
+    fn strict_discovery_rejects_missing_metadata_and_spread() {
+        assert!(strict_profile(None, "USD", None, None, None, 0.0)
+            .expect_err("metadata is mandatory")
+            .to_string()
+            .contains("SymbolMetadata"));
+
+        let mut metadata = strict_metadata("EURUSD", "EUR", "USD");
+        metadata.typical_spread_pips = None;
+        assert!(strict_profile(Some(&metadata), "USD", Some(f64::NAN), None, None, 0.0)
+            .expect_err("invalid explicit spread must fail")
+            .to_string()
+            .contains("spread override"));
+        assert!(strict_profile(Some(&metadata), "USD", None, None, None, 0.0)
+            .expect_err("spread truth is mandatory")
+            .to_string()
+            .contains("spread"));
+        let profile = strict_profile(Some(&metadata), "USD", Some(0.8), None, None, 0.3)
+            .expect("explicit spread plus slippage should resolve");
+        assert!((profile.spread_pips - 1.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn strict_discovery_rejects_missing_commission_without_synthetic_seven() {
+        let mut metadata = strict_metadata("EURUSD", "EUR", "USD");
+        metadata.commission_per_lot = None;
+        assert!(strict_profile(Some(&metadata), "USD", None, Some(f64::NAN), None, 0.0)
+            .expect_err("invalid explicit commission must fail")
+            .to_string()
+            .contains("commission override"));
+        let err = strict_profile(Some(&metadata), "USD", None, None, None, 0.0)
+            .expect_err("missing commission schedule must fail");
+        assert!(err.to_string().contains("commission truth"));
+
+        metadata.commission_per_lot = Some(5.25);
+        let profile = strict_profile(Some(&metadata), "USD", None, None, None, 0.0)
+            .expect("broker commission should resolve");
+        assert_eq!(profile.commission_per_trade, 5.25);
+        assert_ne!(profile.commission_per_trade, 7.0);
+
+        metadata.commission_per_lot = Some(f64::NAN);
+        metadata.commission_type = Some(2);
+        metadata.commission_rate_decimal = Some(4.5);
+        let profile = strict_profile(Some(&metadata), "USD", None, None, None, 0.0)
+            .expect("valid broker schedule should replace invalid precomputed commission");
+        assert_eq!(profile.commission_per_trade, 4.5);
+    }
+
+    #[test]
+    fn strict_discovery_requires_both_swaps_but_accepts_authoritative_zero() {
+        let mut metadata = strict_metadata("EURUSD", "EUR", "USD");
+        metadata.daily_swap_long_pips = None;
+        assert!(strict_profile(Some(&metadata), "USD", None, None, None, 0.0)
+            .expect_err("long swap is mandatory")
+            .to_string()
+            .contains("swap_long"));
+
+        metadata.daily_swap_long_pips = Some(0.0);
+        metadata.daily_swap_short_pips = None;
+        assert!(strict_profile(Some(&metadata), "USD", None, None, None, 0.0)
+            .expect_err("short swap is mandatory")
+            .to_string()
+            .contains("swap_short"));
+
+        metadata.daily_swap_short_pips = Some(0.0);
+        let profile = strict_profile(Some(&metadata), "USD", None, None, None, 0.0)
+            .expect("broker zero swaps are authoritative");
+        assert_eq!(profile.swap_long_pips_per_day, 0.0);
+        assert_eq!(profile.swap_short_pips_per_day, 0.0);
+    }
+
+    #[test]
+    fn strict_discovery_conversion_fee_depends_on_quote_currency() {
+        let same_quote = strict_metadata("EURUSD", "EUR", "USD");
+        assert_eq!(
+            strict_profile(Some(&same_quote), "USD", None, None, None, 0.0)
+                .expect("same quote requires no fee metadata")
+                .pnl_conversion_fee_rate,
+            0.0
+        );
+
+        let cross = strict_metadata("EURUSD", "EUR", "USD");
+        assert!(strict_profile(Some(&cross), "GBP", None, None, Some(0.79), 0.0)
+            .expect_err("cross account requires fee metadata")
+            .to_string()
+            .contains("conversion fee"));
+    }
+
+    #[test]
+    fn strict_discovery_cross_pair_requires_real_conversion_rate() {
+        let mut metadata = strict_metadata("EURUSD", "EUR", "USD");
+        metadata.pnl_conversion_fee_rate = Some(0.001);
+        assert!(strict_profile(Some(&metadata), "GBP", None, None, None, 0.0)
+            .expect_err("cross pair requires quote conversion")
+            .to_string()
+            .contains("quote→account"));
+
+        let profile = strict_profile(Some(&metadata), "GBP", None, None, Some(0.79), 0.0)
+            .expect("real quote conversion should resolve");
+        assert!((profile.pip_value_per_lot - 7.9).abs() < 1e-12);
+        assert!(profile.pip_value_per_lot.is_finite());
+    }
+
+    #[test]
+    fn strict_discovery_uses_real_price_and_usd_conversion_when_required() {
+        let mut base_account = strict_metadata("EURUSD", "EUR", "USD");
+        assert!(
+            resolve_strict_discovery_cost_profile_from_metadata(
+                "EURUSD",
+                "EUR",
+                Some(&base_account),
+                None,
+                None,
+                Some(0.91),
+                None,
+                0.0,
+            )
+            .expect_err("base-currency account requires a real price")
+            .to_string()
+            .contains("price hint")
+        );
+
+        base_account.pnl_conversion_fee_rate = Some(0.001);
+        let profile = resolve_strict_discovery_cost_profile_from_metadata(
+            "EURUSD",
+            "GBP",
+            Some(&base_account),
+            None,
+            None,
+            Some(0.8),
+            Some(1.1),
+            0.0,
+        )
+        .expect("precomputed quote-currency commission should convert to account currency");
+        assert!((profile.commission_per_trade - 4.8).abs() < 1e-12);
+
+        base_account.commission_per_lot = None;
+        base_account.commission_type = Some(2);
+        base_account.commission_rate_decimal = Some(5.0);
+        let profile = resolve_strict_discovery_cost_profile_from_metadata(
+            "EURUSD",
+            "GBP",
+            Some(&base_account),
+            None,
+            None,
+            Some(0.8),
+            Some(1.1),
+            0.0,
+        )
+        .expect("USD quote rate also supplies USD-to-account commission conversion");
+        assert!((profile.commission_per_trade - 4.0).abs() < 1e-12);
+
+        let mut usd_base = strict_metadata("USDJPY", "USD", "JPY");
+        usd_base.pip_size = 0.01;
+        usd_base.pip_value_quote = 1_000.0;
+        usd_base.commission_per_lot = None;
+        usd_base.commission_type = Some(2);
+        usd_base.commission_rate_decimal = Some(5.0);
+        usd_base.pnl_conversion_fee_rate = Some(0.001);
+        let profile = resolve_strict_discovery_cost_profile_from_metadata(
+            "USDJPY",
+            "EUR",
+            Some(&usd_base),
+            None,
+            None,
+            Some(0.006),
+            Some(150.0),
+            0.0,
+        )
+        .expect("base-USD price and quote rate should derive USD-to-account conversion");
+        assert!((profile.commission_per_trade - 4.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn strict_profile_survives_market_profile_to_evaluation_config() {
+        let mut metadata = strict_metadata("EURUSD", "EUR", "USD");
+        metadata.daily_swap_long_pips = Some(-0.7);
+        metadata.daily_swap_short_pips = Some(0.2);
+        metadata.pnl_conversion_fee_rate = Some(0.003);
+        let profile = strict_profile(Some(&metadata), "GBP", None, None, Some(0.8), 0.4)
+            .expect("complete strict profile");
+        let evaluation = EvaluationConfig::from_market_cost_profile(profile.clone());
+
+        assert_eq!(evaluation.swap_long_pips_per_day, profile.swap_long_pips_per_day);
+        assert_eq!(evaluation.swap_short_pips_per_day, profile.swap_short_pips_per_day);
+        assert_eq!(evaluation.pnl_conversion_fee_rate, profile.pnl_conversion_fee_rate);
+        assert!(evaluation.pip_value.is_finite());
+        assert!(evaluation.pip_value_per_lot.is_finite());
+        assert!(evaluation.spread_pips.is_finite());
+        assert!(evaluation.commission_per_trade.is_finite());
     }
 
     // Note: a follow-up test will verify that broker-supplied swap +

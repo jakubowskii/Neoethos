@@ -422,6 +422,9 @@ pub fn evaluate_genes_cached(
         spread_pips: config.spread_pips,
         commission_per_trade: config.commission_per_trade,
         pip_value_per_lot: config.pip_value_per_lot,
+        swap_long_pips_per_day: config.swap_long_pips_per_day,
+        swap_short_pips_per_day: config.swap_short_pips_per_day,
+        pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
         ..Default::default()
     };
 
@@ -1120,6 +1123,9 @@ pub fn evaluate_genes(
         spread_pips: config.spread_pips,
         commission_per_trade: config.commission_per_trade,
         pip_value_per_lot: config.pip_value_per_lot,
+        swap_long_pips_per_day: config.swap_long_pips_per_day,
+        swap_short_pips_per_day: config.swap_short_pips_per_day,
+        pnl_conversion_fee_rate: config.pnl_conversion_fee_rate,
         ..Default::default()
     };
 
