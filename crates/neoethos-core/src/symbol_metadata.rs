@@ -125,7 +125,7 @@ pub struct SymbolMetadata {
     /// Stored as a **fraction**, e.g. `0.0005` = 0.05 %. cTrader's
     /// proto value is `i32` with the convention `1 = 0.01 %`, so the
     /// conversion is `fraction = proto_value / 10_000.0`. Applied
-    /// once at trade exit: `pnl_net = pnl_gross × (1 − fee_rate)`.
+    /// once at trade exit: `pnl_net = pnl_gross − abs(pnl_gross) × fee_rate`.
     /// Typical broker values: 0.005 – 0.01 (0.5 – 1 %) for cross-
     /// currency accounts; `None` for same-quote-and-deposit accounts
     /// (no conversion needed).

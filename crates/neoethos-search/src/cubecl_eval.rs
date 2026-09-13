@@ -997,7 +997,12 @@ fn backtest_population_kernel(
                 pnl_cell.store(pnl_cell.read() + swap_credit_gap);
                 // PnL conversion fee applied last; skip if out-of-range.
                 if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
-                    pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
+                    let pnl_before_fee = pnl_cell.read();
+                    let fee_base = RuntimeCell::<f32>::new(pnl_before_fee);
+                    if pnl_before_fee < 0.0 {
+                        fee_base.store(-pnl_before_fee);
+                    }
+                    pnl_cell.store(pnl_before_fee - fee_base.read() * pnl_conversion_fee_rate);
                 }
                 let pnl = pnl_cell.read();
                 equity.store(equity.read() + pnl);
@@ -1160,7 +1165,12 @@ fn backtest_population_kernel(
                         swap_per_day.read() * position_days.read() * pip_value_per_lot * pos_lots.read();
                     pnl_cell.store(pnl_cell.read() + swap_credit);
                     if pnl_conversion_fee_rate > 0.0 && pnl_conversion_fee_rate < 1.0 {
-                        pnl_cell.store(pnl_cell.read() * (1.0 - pnl_conversion_fee_rate));
+                        let pnl_before_fee = pnl_cell.read();
+                        let fee_base = RuntimeCell::<f32>::new(pnl_before_fee);
+                        if pnl_before_fee < 0.0 {
+                            fee_base.store(-pnl_before_fee);
+                        }
+                        pnl_cell.store(pnl_before_fee - fee_base.read() * pnl_conversion_fee_rate);
                     }
                     let pnl = pnl_cell.read();
                     equity.store(equity.read() + pnl);

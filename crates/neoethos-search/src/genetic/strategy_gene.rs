@@ -78,7 +78,7 @@ pub struct MarketCostProfile {
     /// projection (`SymbolFinancials::daily_swap_long/short`,
     /// `pnl_conversion_fee_rate`). The CPU + GPU eval kernels
     /// subtract `swap_pips × overnight_days × pip_value_per_lot` at
-    /// each trade exit and apply `(1 − pnl_conversion_fee_rate)`
+    /// each trade exit and subtract `abs(pnl) × pnl_conversion_fee_rate`
     /// once. Defaulting to 0 is **deliberate fail-safe** so a
     /// missing-broker-data run still produces a backtest; the GA
     /// fitness function additionally penalises strategies that lean

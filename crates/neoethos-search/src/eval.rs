@@ -155,8 +155,8 @@ pub struct BacktestSettings {
     /// missing-broker-data path.
     pub swap_long_pips_per_day: f64,
     pub swap_short_pips_per_day: f64,
-    /// **Phase C (2026-05-28)** — `pnl_net = pnl_gross × (1 −
-    /// pnl_conversion_fee_rate)` applied once per closed trade.
+    /// **Phase C (2026-05-28)** — conversion fee applied once per closed
+    /// trade: `pnl_net = pnl − abs(pnl) × pnl_conversion_fee_rate`.
     /// Fraction (0.005 = 0.5 %), default 0.0.
     pub pnl_conversion_fee_rate: f64,
 
@@ -557,10 +557,19 @@ impl BacktestSettings {
 ///     ↑ broker sign convention: positive = credit, negative = charge
 ///   pnl_with_carry = gross_pnl + swap_pips_per_day × overnight_days
 ///                      × pip_value_per_lot
-///   net_pnl = pnl_with_carry × (1 − pnl_conversion_fee_rate)
+///   net_pnl = pnl_with_carry − abs(pnl_with_carry) × pnl_conversion_fee_rate
 ///
 /// With both swap fields = 0.0 and conversion fee = 0.0 this is the
 /// identity, matching the pre-Phase-C kernel exactly.
+#[inline]
+fn apply_pnl_conversion_fee(pnl: f64, fee_rate: f64) -> f64 {
+    if fee_rate.is_finite() && fee_rate > 0.0 && fee_rate < 1.0 {
+        pnl - pnl.abs() * fee_rate
+    } else {
+        pnl
+    }
+}
+
 #[inline]
 fn apply_carry_and_fee(
     gross_pnl: f64,
@@ -581,12 +590,7 @@ fn apply_carry_and_fee(
     };
     let swap_credit = swap_pips_per_day * overnight_days * settings.pip_value_per_lot;
     let pnl_with_carry = gross_pnl + swap_credit;
-    let conv_fee = settings.pnl_conversion_fee_rate;
-    if conv_fee.is_finite() && conv_fee > 0.0 && conv_fee < 1.0 {
-        pnl_with_carry * (1.0 - conv_fee)
-    } else {
-        pnl_with_carry
-    }
+    apply_pnl_conversion_fee(pnl_with_carry, settings.pnl_conversion_fee_rate)
 }
 
 /// Risk-based-sizing-aware wrapper around [`apply_carry_and_fee`].
@@ -595,8 +599,8 @@ fn apply_carry_and_fee(
 /// ALREADY scaled by `pos_lots`. The overnight SWAP term inside
 /// [`apply_carry_and_fee`] uses `pip_value_per_lot` and therefore must ALSO
 /// scale with position size; this wrapper scales the swap by `pos_lots` so
-/// the whole trade is sized consistently. The conversion fee is a
-/// multiplicative fraction and is applied once at the end (unchanged).
+/// the whole trade is sized consistently. The conversion fee is applied
+/// once to the fully scaled PnL at the end.
 ///
 /// With `pos_lots == 1.0` this is identical to `apply_carry_and_fee`, so the
 /// legacy fixed-1-lot path is byte-for-byte preserved.
@@ -626,12 +630,7 @@ fn apply_carry_and_fee_scaled(
     // Swap term scales with size (it is a per-lot cash flow).
     let swap_credit = swap_pips_per_day * overnight_days * settings.pip_value_per_lot * pos_lots;
     let pnl_with_carry = gross_pnl_scaled + swap_credit;
-    let conv_fee = settings.pnl_conversion_fee_rate;
-    if conv_fee.is_finite() && conv_fee > 0.0 && conv_fee < 1.0 {
-        pnl_with_carry * (1.0 - conv_fee)
-    } else {
-        pnl_with_carry
-    }
+    apply_pnl_conversion_fee(pnl_with_carry, settings.pnl_conversion_fee_rate)
 }
 
 /// Risk-based, confidence-scaled lot size for a single trade entry.
@@ -2372,6 +2371,16 @@ mod overrides_tests {
     }
 
     #[test]
+    fn pnl_conversion_fee_charges_profit_and_loss_without_changing_zero() {
+        assert!((apply_pnl_conversion_fee(100.0, 0.005) - 99.5).abs() < 1e-12);
+        assert!((apply_pnl_conversion_fee(-100.0, 0.005) + 100.5).abs() < 1e-12);
+        assert_eq!(apply_pnl_conversion_fee(0.0, 0.005), 0.0);
+
+        let pnl = -123.45;
+        assert_eq!(apply_pnl_conversion_fee(pnl, 0.0).to_bits(), pnl.to_bits());
+    }
+
+    #[test]
     fn carry_fee_zero_zero_is_identity() {
         let s = settings_with_carry(0.0, 0.0, 0.0, 10.0);
         // Day-trade (entry == exit): no swap, no fee → gross.
@@ -2417,11 +2426,65 @@ mod overrides_tests {
 
     #[test]
     fn carry_fee_conversion_scales_after_swap() {
-        // Conversion fee 0.5% applied AFTER swap.
-        // No swap, fee = 0.005. Gross $100 → net $99.50.
+        // Gross $100 + carry −$10 = $90; 0.5% fee applies to $90.
+        let s = settings_with_carry(-1.0, 0.0, 0.005, 10.0);
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry + 86_400_000;
+        let net = apply_carry_and_fee(100.0, 1, entry, exit, &s);
+        assert!((net - 89.55).abs() < 1e-9, "expected 89.55, got {net}");
+    }
+
+    #[test]
+    fn carry_fee_makes_negative_post_carry_pnl_more_negative() {
+        // Gross $5 + carry −$10 = −$5; 0.5% fee makes final PnL −$5.025.
+        let s = settings_with_carry(-1.0, 0.0, 0.005, 10.0);
+        let entry = 1_700_000_000_000_i64;
+        let exit = entry + 86_400_000;
+        let net = apply_carry_and_fee(5.0, 1, entry, exit, &s);
+        assert!((net + 5.025).abs() < 1e-9, "expected -5.025, got {net}");
+    }
+
+    #[test]
+    fn scaled_fee_runs_after_position_sizing_and_matches_one_lot() {
         let s = settings_with_carry(0.0, 0.0, 0.005, 10.0);
-        let net = apply_carry_and_fee(100.0, 1, 0, 0, &s);
-        assert!((net - 99.5).abs() < 1e-6, "expected 99.5, got {net}");
+        // Unscaled −$100 at 2 lots reaches this helper as fully scaled −$200.
+        let scaled = apply_carry_and_fee_scaled(-200.0, 2.0, 1, 0, 0, &s);
+        assert!((scaled + 201.0).abs() < 1e-12);
+
+        let fixed = apply_carry_and_fee(100.0, 1, 0, 0, &s);
+        let scaled_one = apply_carry_and_fee_scaled(100.0, 1.0, 1, 0, 0, &s);
+        assert_eq!(fixed.to_bits(), scaled_one.to_bits());
+    }
+
+    #[test]
+    fn canonical_discovery_evaluator_charges_conversion_fee_on_loss() {
+        let close = [1.0, 1.0, 0.99, 0.99];
+        let high = [1.0001; 4];
+        let low = [0.9999, 0.9999, 0.99, 0.99];
+        let signals = [1, 0, 0, 0];
+        let buckets = [0; 4];
+        let mut settings = settings_with_carry(0.0, 0.0, 0.005, 10.0);
+        settings.sl_pips = 20.0;
+        settings.tp_pips = 10_000.0;
+        settings.pip_value = 0.0001;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = false;
+
+        let metrics = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &[],
+            &buckets,
+            &buckets,
+            &[],
+            &settings,
+        );
+        assert_eq!(metrics[8], 1.0);
+        assert!((metrics[0] + 201.0).abs() < 1e-9, "net={}", metrics[0]);
     }
 
     #[test]
@@ -2684,7 +2747,8 @@ mod gpu_cpu_parity_tests {
         settings.commission_per_trade = 0.0;
         settings.swap_long_pips_per_day = 0.0;
         settings.swap_short_pips_per_day = 0.0;
-        settings.pnl_conversion_fee_rate = 0.0;
+        // Non-zero fee makes this CPU/GPU parity gate exercise both PnL signs.
+        settings.pnl_conversion_fee_rate = 0.005;
         settings.kill_zones_enabled = false;
         settings.risk_based_sizing = true;
         settings.risk_per_trade_min = 0.005;
