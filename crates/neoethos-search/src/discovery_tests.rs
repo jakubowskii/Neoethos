@@ -404,6 +404,308 @@ fn cpcv_zero_splits_is_not_executed_or_passed() {
     assert_eq!(gate.fold_count, 0);
 }
 
+struct CpcvSegmentFixture {
+    indicators: ndarray::Array2<f32>,
+    smc: Vec<crate::eval::SmcRow>,
+    gene: Gene,
+    config: crate::genetic::strategy_gene::EvaluationConfig,
+    settings: crate::eval::BacktestSettings,
+    close: Vec<f64>,
+    months: Vec<i64>,
+    days: Vec<i64>,
+    timestamps: Vec<i64>,
+}
+
+fn cpcv_segment_fixture() -> CpcvSegmentFixture {
+    let close = vec![100.0, 100.0, 99.0, 100.0, 100.0, 100.0, 100.0, 102.0];
+    let mut gene = Gene::default();
+    gene.indices = vec![0];
+    gene.weights = vec![1.0];
+    gene.long_threshold = 0.5;
+    gene.short_threshold = -0.5;
+    gene.sl_pips = 1_000_000.0;
+    gene.tp_pips = 1_000_000.0;
+    let mut settings = crate::eval::BacktestSettings::default();
+    settings.sl_pips = gene.sl_pips;
+    settings.tp_pips = gene.tp_pips;
+    settings.max_hold_bars = 1;
+    settings.min_hold_bars = 1;
+    settings.pip_value = 1.0;
+    settings.pip_value_per_lot = 1.0;
+    settings.spread_pips = 0.0;
+    settings.commission_per_trade = 0.0;
+    settings.swap_long_pips_per_day = 0.0;
+    settings.swap_short_pips_per_day = 0.0;
+    settings.pnl_conversion_fee_rate = 0.0;
+    settings.kill_zones_enabled = false;
+    settings.risk_based_sizing = false;
+    CpcvSegmentFixture {
+        indicators: ndarray::Array2::from_elem((1, close.len()), 1.0),
+        smc: vec![[0; 11]; close.len()],
+        gene,
+        config: crate::genetic::strategy_gene::EvaluationConfig::default(),
+        settings,
+        close,
+        months: vec![2024 * 12 + 1; 8],
+        days: vec![20240101, 20240101, 20240101, 20240102, 20240102, 20240104, 20240104, 20240104],
+        timestamps: vec![
+            1_704_096_000_000,
+            1_704_099_600_000,
+            1_704_103_200_000,
+            1_704_182_400_000,
+            1_704_186_000_000,
+            1_704_355_200_000,
+            1_704_358_800_000,
+            1_704_362_400_000,
+        ],
+    }
+}
+
+#[test]
+fn cpcv_contiguous_runs_split_and_reject_malformed_indices() {
+    use crate::genetic::contiguous_index_runs;
+
+    assert_eq!(
+        contiguous_index_runs(&[1, 2, 3, 8, 9, 20]).expect("valid indices"),
+        vec![1..4, 8..10, 20..21]
+    );
+    assert!(contiguous_index_runs(&[1, 2, 2]).is_err());
+    assert!(contiguous_index_runs(&[2, 1]).is_err());
+    assert!(contiguous_index_runs(&[usize::MAX]).is_err());
+}
+
+#[test]
+fn cpcv_segmented_fold_matches_explicit_segment_aggregation() {
+    use crate::genetic::{
+        validation_genes_population_gathered, validation_genes_population_segmented,
+    };
+
+    let fixture = cpcv_segment_fixture();
+    let genes = [fixture.gene.clone()];
+    let selected = [0, 1, 2, 5, 6, 7];
+    let segmented = validation_genes_population_segmented(
+        fixture.indicators.view(),
+        &fixture.smc,
+        &genes,
+        &fixture.config,
+        &fixture.settings,
+        &selected,
+        &fixture.close,
+        &fixture.close,
+        &fixture.close,
+        &fixture.months,
+        &fixture.days,
+        &fixture.timestamps,
+    )
+    .expect("disjoint fold should evaluate");
+
+    let eval_run = |run: std::ops::Range<usize>| {
+        let indices: Vec<usize> = run.clone().collect();
+        validation_genes_population_gathered(
+            fixture.indicators.view(),
+            &fixture.smc,
+            &genes,
+            &fixture.config,
+            &fixture.settings,
+            &indices,
+            &fixture.close[run.clone()],
+            &fixture.close[run.clone()],
+            &fixture.close[run.clone()],
+            &fixture.months[run.clone()],
+            &fixture.days[run.clone()],
+            &fixture.timestamps[run],
+        )
+        .expect("contiguous run should evaluate")[0]
+    };
+    let left = BacktestMetrics::from_metric_array(eval_run(0..3));
+    let right = BacktestMetrics::from_metric_array(eval_run(5..8));
+
+    assert_eq!(segmented.len(), 1);
+    assert!(segmented[0].metrics_valid);
+    assert!((segmented[0].net_profit - (left.net_profit + right.net_profit)).abs() < 1e-9);
+    assert_eq!(segmented[0].trade_count, left.trade_count + right.trade_count);
+    assert_eq!(
+        segmented[0].max_drawdown,
+        left.max_drawdown.max(right.max_drawdown)
+    );
+}
+
+#[test]
+fn cpcv_segment_reset_blocks_cross_gap_trade_and_swap() {
+    use crate::genetic::{
+        validation_genes_population_gathered, validation_genes_population_segmented,
+    };
+
+    let mut fixture = cpcv_segment_fixture();
+    fixture.settings.swap_long_pips_per_day = 5.0;
+    let genes = [fixture.gene.clone()];
+    let selected = [0, 1, 5, 6];
+    let segmented = validation_genes_population_segmented(
+        fixture.indicators.view(),
+        &fixture.smc,
+        &genes,
+        &fixture.config,
+        &fixture.settings,
+        &selected,
+        &fixture.close,
+        &fixture.close,
+        &fixture.close,
+        &fixture.months,
+        &fixture.days,
+        &fixture.timestamps,
+    )
+    .expect("disjoint fold should reset each segment");
+    assert_eq!(segmented[0].trade_count, 0);
+    assert_eq!(segmented[0].net_profit, 0.0);
+
+    let gathered_close: Vec<f64> = selected.iter().map(|index| fixture.close[*index]).collect();
+    let gathered_months: Vec<i64> = selected.iter().map(|index| fixture.months[*index]).collect();
+    let gathered_days: Vec<i64> = selected.iter().map(|index| fixture.days[*index]).collect();
+    let gathered_timestamps: Vec<i64> = selected
+        .iter()
+        .map(|index| fixture.timestamps[*index])
+        .collect();
+    assert!(validation_genes_population_gathered(
+        fixture.indicators.view(),
+        &fixture.smc,
+        &genes,
+        &fixture.config,
+        &fixture.settings,
+        &selected,
+        &gathered_close,
+        &gathered_close,
+        &gathered_close,
+        &gathered_months,
+        &gathered_days,
+        &gathered_timestamps,
+    )
+    .is_err());
+    let old_concatenated = fast_evaluate_strategy_core(
+        &gathered_close,
+        &gathered_close,
+        &gathered_close,
+        &[1, 1, 1, 1],
+        &[],
+        &gathered_months,
+        &gathered_days,
+        &gathered_timestamps,
+        &fixture.settings,
+    );
+    assert_eq!(old_concatenated[8], 1.0);
+    assert!(old_concatenated[0].abs() > 0.0);
+}
+
+#[test]
+fn cpcv_segmented_evaluation_requires_real_aligned_timestamps() {
+    use crate::genetic::validation_genes_population_segmented;
+
+    let fixture = cpcv_segment_fixture();
+    let genes = [fixture.gene.clone()];
+    let evaluate = |timestamps: &[i64]| {
+        validation_genes_population_segmented(
+            fixture.indicators.view(),
+            &fixture.smc,
+            &genes,
+            &fixture.config,
+            &fixture.settings,
+            &[0, 1, 2],
+            &fixture.close,
+            &fixture.close,
+            &fixture.close,
+            &fixture.months,
+            &fixture.days,
+            timestamps,
+        )
+    };
+    assert!(evaluate(&fixture.timestamps[..7]).is_err());
+    let mut non_increasing = fixture.timestamps.clone();
+    non_increasing[1] = non_increasing[0];
+    assert!(evaluate(&non_increasing).is_err());
+    let mut zero = fixture.timestamps.clone();
+    zero[0] = 0;
+    assert!(evaluate(&zero).is_err());
+}
+
+#[test]
+fn cpcv_segments_use_real_timestamps_for_session_spread() {
+    use crate::eval::SessionSpreadProfile;
+    use crate::genetic::validation_genes_population_segmented;
+
+    let mut fixture = cpcv_segment_fixture();
+    fixture.close.fill(100.0);
+    fixture.settings.session_spread_profile = Some(SessionSpreadProfile {
+        asian_pips: 10.0,
+        overlap_pips: 0.0,
+        late_ny_pips: 5.0,
+    });
+    let genes = [fixture.gene.clone()];
+    let evaluate = |timestamps: &[i64]| {
+        validation_genes_population_segmented(
+            fixture.indicators.view(),
+            &fixture.smc,
+            &genes,
+            &fixture.config,
+            &fixture.settings,
+            &[0, 1, 2],
+            &fixture.close,
+            &fixture.close,
+            &fixture.close,
+            &fixture.months,
+            &fixture.days,
+            timestamps,
+        )
+        .expect("valid session timestamps")[0]
+    };
+    let overlap = evaluate(&fixture.timestamps);
+    let mut asian_timestamps = fixture.timestamps.clone();
+    asian_timestamps[0..3].copy_from_slice(&[
+        1_704_150_000_000,
+        1_704_150_060_000,
+        1_704_150_120_000,
+    ]);
+    let asian = evaluate(&asian_timestamps);
+
+    assert_eq!(overlap.trade_count, 1);
+    assert_eq!(asian.trade_count, 1);
+    assert!(overlap.net_profit > asian.net_profit);
+}
+
+#[test]
+fn cpcv_and_pbo_execute_through_segmented_population_path() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let portfolio = vec![profitable_gene("cpcv-segmented")];
+    let signals = vec![vec![0; ohlcv.close.len()]];
+    let pbo_candidates: Vec<Gene> = (0..MIN_PBO_CANDIDATES)
+        .map(|index| profitable_gene(&format!("pbo-segmented-{index}")))
+        .collect();
+    let (months, days) = month_day_indices(&features.timestamps);
+    let config = DiscoveryConfig {
+        cpcv_n_splits: 4,
+        cpcv_n_test_groups: 2,
+        cpcv_purge_pct: 0.0,
+        cpcv_embargo_pct: 0.0,
+        ..DiscoveryConfig::default()
+    };
+
+    let gate = evaluate_cpcv_gate(
+        &portfolio,
+        &signals,
+        &features,
+        &ohlcv,
+        &config,
+        &months,
+        &days,
+        &pbo_candidates,
+    )
+    .expect("CPCV and PBO should evaluate segmented folds");
+
+    assert!(gate.executed);
+    assert!(gate.fold_count > 0);
+    assert!(gate.pbo_executed);
+    assert!(gate.pbo_splits > 0);
+}
+
 #[test]
 fn cpcv_population_evaluator_matches_canonical_risk_sizing() {
     let features = sample_feature_frame();
@@ -427,7 +729,7 @@ fn cpcv_population_evaluator_matches_canonical_risk_sizing() {
     let absolute_idx: Vec<usize> = (0..ohlcv.close.len()).collect();
     let (months, days) = month_day_indices(&features.timestamps);
 
-    let population = validation_genes_population_gathered(
+    let population = crate::genetic::validation_genes_population_gathered(
         indicators,
         &full_smc,
         &genes,
@@ -439,6 +741,7 @@ fn cpcv_population_evaluator_matches_canonical_risk_sizing() {
         &ohlcv.low,
         &months,
         &days,
+        &features.timestamps,
     )
     .expect("CPCV population evaluator should run");
     let (signals, confidences) =
@@ -451,7 +754,7 @@ fn cpcv_population_evaluator_matches_canonical_risk_sizing() {
         &confidences,
         &months,
         &days,
-        &[],
+        &features.timestamps,
         &settings,
     );
 

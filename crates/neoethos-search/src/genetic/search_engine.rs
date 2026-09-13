@@ -6,7 +6,7 @@ use super::evolution_math::{
 use super::runtime_overrides::current_genetic_search_runtime_overrides;
 use super::smc_indicators::{SmcSearchConfig, build_smc_arrays, enforce_population_smc_ratio};
 use super::strategy_gene::{EvaluationConfig, Gene, SearchResult};
-use crate::eval::BacktestSettings;
+use crate::eval::{BacktestMetrics, BacktestSettings};
 use crate::stop_target::{StopTargetSettings, infer_stop_target_pips};
 use anyhow::{Result, anyhow, bail};
 use chrono::{Datelike, TimeZone, Utc};
@@ -14,6 +14,7 @@ use ndarray::Array2;
 use neoethos_data::{FeatureFrame, Ohlcv};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashSet;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 /// Build a deterministic RNG by routing the genetic-search runtime
@@ -583,48 +584,123 @@ pub fn validation_genes_population(
     ))
 }
 
-/// AREA 2 / Stage B (2026-06-09) — GPU-routed **CPCV fold** population eval over a
-/// NON-CONTIGUOUS gathered index set.
-///
-/// This is the CPCV twin of [`validation_genes_population`]. The CPCV gate
-/// (`discovery::evaluate_cpcv_gate`) backtests every portfolio gene on each
-/// Combinatorial-Purged-CV fold, where a fold is a set of *gathered*
-/// (re-indexed, non-monotonic) absolute bar indices `absolute_idx`. The serial
-/// CPU path gathers the per-bar arrays HOST-SIDE into fresh contiguous Vecs and
-/// runs `fast_evaluate_strategy_core` on them — the backtest never sees the gaps
-/// because the gather already happened. This helper feeds the GPU population
-/// kernel the SAME host-gathered contiguous buffers, so the kernel is byte-
-/// identical to the CPU's gathered-Vec path WITHOUT any kernel change.
-///
-/// ## Why this can't reuse [`validation_genes_population`]
-/// Two deliberate differences:
-///  1. **SMC is gathered, NOT recomputed.** `validation_genes_population` calls
-///     `build_smc_arrays` on the *passed* OHLCV. The SMC primitives in
-///     `derive_smc_arrays` carry heavy cross-bar LOOKBACK (trend uses
-///     `close[i-12]`, BoS/EQH/EQL use 12–20-bar windows, FVG/liq use 2–3-bar
-///     windows). Recomputing SMC on a gathered (non-contiguous) OHLCV slice would
-///     read the WRONG neighbours and silently corrupt the fold. The CPU CPCV path
-///     avoids this by gathering the *full-series* precomputed signals/confidence;
-///     this helper mirrors it by computing the full-series SMC arrays ONCE and
-///     GATHERING them at `absolute_idx`. Signal synthesis is fully pointwise
-///     (`combined[i]` = weighted sum of indicator[i]; the gate reads only
-///     `smc_row[i]`), so the on-device synth at gathered position `k` reads the
-///     SAME indicator+SMC values the full-series synth read at `absolute_idx[k]`
-///     → identical signals/confidence → identical fold metrics.
-///  2. **`risk_based_sizing` is PRESERVED from the caller's template**, not forced
-///     to `false`. CPCV uses `discovery_backtest_settings` which inherits
-///     `BacktestSettings::default().risk_based_sizing == true` and feeds the gene's
-///     REAL per-bar confidence into the risk sizer. The kernel recomputes the
-///     identical confidence on-device (pointwise), so risk-based sizing matches.
-///
-/// `timestamps` is passed empty (`&[]`) so the backtest uses index-delta carry —
-/// EXACTLY as the serial CPCV path does (`fast_evaluate_strategy_core(..., &[], ...)`).
-///
-/// Per-gene `sl_pips`/`tp_pips` use the SAME finite-positive-else-20/40 fallback
-/// `discovery_backtest_settings` applies, so SL/TP exits match the serial run.
-///
-/// Returns one `[f64; 11]` metric row per gene (same layout as
-/// [`crate::eval::evaluate_population_core`]).
+pub fn contiguous_index_runs(indices: &[usize]) -> Result<Vec<Range<usize>>> {
+    let Some(&first) = indices.first() else {
+        return Ok(Vec::new());
+    };
+    if indices.contains(&usize::MAX) {
+        bail!("CV indices exceed representable segment bounds");
+    }
+    let mut runs = Vec::new();
+    let mut start = first;
+    let mut previous = first;
+    for &current in &indices[1..] {
+        if current <= previous {
+            bail!("CV indices must be strictly increasing and unique");
+        }
+        if current != previous + 1 {
+            runs.push(start..previous + 1);
+            start = current;
+        }
+        previous = current;
+    }
+    runs.push(start..previous + 1);
+    Ok(runs)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValidationSegmentMetrics {
+    pub net_profit: f64,
+    pub max_drawdown: f64,
+    pub trade_count: usize,
+    pub metrics_valid: bool,
+}
+
+/// Evaluate disjoint CV selections as independent contiguous backtests, then
+/// aggregate only metrics consumed by CPCV/PBO.
+#[allow(clippy::too_many_arguments)]
+pub fn validation_genes_population_segmented(
+    full_indicators: ndarray::ArrayView2<'_, f32>,
+    full_smc: &[crate::eval::SmcRow],
+    genes: &[Gene],
+    config: &EvaluationConfig,
+    settings_template: &BacktestSettings,
+    absolute_idx: &[usize],
+    full_close: &[f64],
+    full_high: &[f64],
+    full_low: &[f64],
+    full_months: &[i64],
+    full_days: &[i64],
+    full_timestamps: &[i64],
+) -> Result<Vec<ValidationSegmentMetrics>> {
+    let n = full_indicators.ncols();
+    if full_smc.len() != n
+        || full_close.len() != n
+        || full_high.len() != n
+        || full_low.len() != n
+        || full_months.len() != n
+        || full_days.len() != n
+        || full_timestamps.len() != n
+    {
+        bail!("CPCV/PBO full-series arrays must have identical lengths");
+    }
+    let runs = contiguous_index_runs(absolute_idx)?;
+    if let Some(run) = runs.iter().find(|run| run.end > n) {
+        bail!("CV segment {:?} exceeds full series length {}", run, n);
+    }
+    if genes.is_empty() || runs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut aggregate = vec![
+        ValidationSegmentMetrics {
+            net_profit: 0.0,
+            max_drawdown: 0.0,
+            trade_count: 0,
+            metrics_valid: true,
+        };
+        genes.len()
+    ];
+    for run in runs {
+        let timestamps = &full_timestamps[run.clone()];
+        if timestamps.iter().any(|timestamp| *timestamp <= 0)
+            || timestamps.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            bail!("CPCV/PBO segment timestamps must be positive and strictly increasing");
+        }
+        let segment_idx: Vec<usize> = run.clone().collect();
+        let metrics = validation_genes_population_gathered(
+            full_indicators,
+            full_smc,
+            genes,
+            config,
+            settings_template,
+            &segment_idx,
+            &full_close[run.clone()],
+            &full_high[run.clone()],
+            &full_low[run.clone()],
+            &full_months[run.clone()],
+            &full_days[run.clone()],
+            timestamps,
+        )?;
+        if metrics.len() != genes.len() {
+            bail!("segment evaluator returned wrong candidate count");
+        }
+        for (total, raw) in aggregate.iter_mut().zip(metrics) {
+            let valid = raw[0].is_finite() && raw[3].is_finite() && raw[8].is_finite();
+            total.metrics_valid &= valid;
+            if valid {
+                let metrics = BacktestMetrics::from_metric_array(raw);
+                total.net_profit += metrics.net_profit;
+                total.trade_count += metrics.trade_count;
+                total.max_drawdown = total.max_drawdown.max(metrics.max_drawdown);
+            }
+        }
+    }
+    Ok(aggregate)
+}
+
+/// Evaluate one contiguous CPCV/PBO segment while preserving full-series SMC.
 #[allow(clippy::too_many_arguments)]
 pub fn validation_genes_population_gathered(
     full_indicators: ndarray::ArrayView2<'_, f32>,
@@ -638,6 +714,7 @@ pub fn validation_genes_population_gathered(
     gathered_low: &[f64],
     gathered_months: &[i64],
     gathered_days: &[i64],
+    gathered_timestamps: &[i64],
 ) -> Result<Vec<[f64; 11]>> {
     if genes.is_empty() || absolute_idx.is_empty() {
         return Ok(Vec::new());
@@ -657,6 +734,7 @@ pub fn validation_genes_population_gathered(
         || gathered_low.len() != fold_n
         || gathered_months.len() != fold_n
         || gathered_days.len() != fold_n
+        || gathered_timestamps.len() != fold_n
     {
         bail!(
             "gathered per-bar arrays must all have length {} (the fold index count)",
@@ -669,6 +747,16 @@ pub fn validation_genes_population_gathered(
             bad,
             full_samples
         );
+    }
+    if absolute_idx.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+        bail!("CPCV/PBO gathered evaluator accepts one contiguous segment only");
+    }
+    if gathered_timestamps.iter().any(|timestamp| *timestamp <= 0)
+        || gathered_timestamps
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        bail!("CPCV/PBO segment timestamps must be positive and strictly increasing");
     }
 
     // Gather the indicator columns at `absolute_idx` into a fresh
@@ -738,10 +826,7 @@ pub fn validation_genes_population_gathered(
         config.smc_weight_displacement,
     ];
 
-    // Use the caller's settings VERBATIM — including `risk_based_sizing` (CPCV
-    // keeps it true so the gene's real per-bar confidence drives sizing, matching
-    // the serial `fast_evaluate_strategy_core` call). Empty `timestamps` ⇒ the
-    // kernel/CPU backtest uses index-delta carry, identical to the serial path.
+    // Each call starts fresh evaluator state and uses real segment timestamps.
     Ok(crate::eval::validation_backtest_population(
         crate::eval::PopulationEvalInputs {
             close: gathered_close,
@@ -755,7 +840,7 @@ pub fn validation_genes_population_gathered(
             short_thr: &short_thr,
             month_idx: gathered_months,
             day_idx: gathered_days,
-            timestamps: &[],
+            timestamps: gathered_timestamps,
             sl_pips: &sl_pips,
             tp_pips: &tp_pips,
             smc_data: &gathered_smc,
