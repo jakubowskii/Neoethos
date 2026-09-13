@@ -343,6 +343,65 @@ fn cpcv_zero_splits_is_not_executed_or_passed() {
 }
 
 #[test]
+fn cpcv_population_evaluator_matches_canonical_risk_sizing() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    let gene = profitable_gene("cpcv-sizing-parity");
+    let genes = vec![gene.clone()];
+    let config = DiscoveryConfig::default();
+    let eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let settings = discovery_backtest_settings(&config, &gene, ohlcv.close.last().copied());
+    let indicators = features.as_indicators_view();
+    let (ob, fvg, liq, trend, prem, ind, bos, choch, eqh, eql, disp) =
+        build_smc_arrays(&features, &ohlcv);
+    let full_smc: Vec<crate::eval::SmcRow> = (0..ohlcv.close.len())
+        .map(|i| {
+            [
+                ob[i], fvg[i], liq[i], trend[i], prem[i], ind[i], bos[i], choch[i], eqh[i],
+                eql[i], disp[i],
+            ]
+        })
+        .collect();
+    let absolute_idx: Vec<usize> = (0..ohlcv.close.len()).collect();
+    let (months, days) = month_day_indices(&features.timestamps);
+
+    let population = validation_genes_population_gathered(
+        indicators,
+        &full_smc,
+        &genes,
+        &eval_config,
+        &settings,
+        &absolute_idx,
+        &ohlcv.close,
+        &ohlcv.high,
+        &ohlcv.low,
+        &months,
+        &days,
+    )
+    .expect("CPCV population evaluator should run");
+    let (signals, confidences) =
+        signals_and_confidence_for_gene_full(&features, &ohlcv, &gene, &eval_config);
+    let canonical = fast_evaluate_strategy_core(
+        &ohlcv.close,
+        &ohlcv.high,
+        &ohlcv.low,
+        &signals,
+        &confidences,
+        &months,
+        &days,
+        &[],
+        &settings,
+    );
+
+    assert_eq!(population.len(), 1);
+    for index in [0usize, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
+        let tolerance = 1e-2 * canonical[index].abs().max(1.0) + 1e-3;
+        assert!((population[0][index] - canonical[index]).abs() <= tolerance);
+    }
+    assert!((population[0][8] - canonical[8]).abs() <= 1.0);
+}
+
+#[test]
 fn mode_overrides_preserve_nonzero_cpcv_threshold() {
     for mode in [DiscoveryMode::PropFirm, DiscoveryMode::Risky] {
         let config = DiscoveryConfig {
@@ -404,6 +463,138 @@ fn plateau_requires_both_finite_variants() {
     assert!(result.permutation_passed);
     assert!(!result.plateau_executed);
     assert!(!result.plateau_passed);
+}
+
+#[test]
+fn robustness_paths_use_canonical_risk_sizing_and_reject_bad_confidence() {
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
+
+    let close = vec![1.0000_f64, 1.0000, 0.9900, 0.9900];
+    let high = vec![1.0001_f64; 4];
+    let low = vec![0.9999_f64, 0.9999, 0.9900, 0.9900];
+    let signals = vec![1_i8, 0, 0, 0];
+    let confidences = vec![1.0_f32; 4];
+    let months = vec![0_i64; 4];
+    let days = vec![0_i64; 4];
+    let timestamps: Vec<i64> = (0..4).map(|i| i * 60_000).collect();
+    let mut settings = crate::eval::BacktestSettings::default();
+    settings.sl_pips = 20.0;
+    settings.tp_pips = 10_000.0;
+    settings.pip_value = 0.0001;
+    settings.pip_value_per_lot = 10.0;
+    settings.spread_pips = 0.0;
+    settings.commission_per_trade = 0.0;
+    settings.kill_zones_enabled = false;
+    settings.risk_based_sizing = true;
+    settings.risk_per_trade_min = 0.01;
+    settings.risk_per_trade_max = 0.01;
+
+    let canonical = fast_evaluate_strategy_core(
+        &close,
+        &high,
+        &low,
+        &signals,
+        &confidences,
+        &months,
+        &days,
+        &timestamps,
+        &settings,
+    )[0];
+    let real = robustness_net_profit(
+        &close,
+        &high,
+        &low,
+        &signals,
+        &confidences,
+        &months,
+        &days,
+        &timestamps,
+        &settings,
+    )
+    .expect("real robustness net must use canonical evaluator");
+    let fixed = fast_evaluate_strategy_core(
+        &close,
+        &high,
+        &low,
+        &signals,
+        &[],
+        &months,
+        &days,
+        &timestamps,
+        &settings,
+    )[0];
+    assert!((real - canonical).abs() < 1e-9);
+    assert!((real - fixed).abs() > 1.0);
+
+    let mut pairs: Vec<(i8, f32)> = signals
+        .iter()
+        .copied()
+        .zip(confidences.iter().copied())
+        .collect();
+    pairs.shuffle(&mut rand::rngs::StdRng::seed_from_u64(7));
+    let (shuffled_signals, shuffled_confidences): (Vec<_>, Vec<_>) =
+        pairs.iter().copied().unzip();
+    assert!(pairs.iter().all(|pair| {
+        signals
+            .iter()
+            .copied()
+            .zip(confidences.iter().copied())
+            .any(|original| original == *pair)
+    }));
+    assert!(robustness_net_profit(
+        &close,
+        &high,
+        &low,
+        &shuffled_signals,
+        &shuffled_confidences,
+        &months,
+        &days,
+        &timestamps,
+        &settings,
+    )
+    .is_some());
+
+    for confidence in [0.4_f32, 0.8_f32] {
+        let variant_confidence = vec![confidence; 4];
+        let variant = robustness_net_profit(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &variant_confidence,
+            &months,
+            &days,
+            &timestamps,
+            &settings,
+        )
+        .expect("plateau variant must retain canonical sizing");
+        let expected = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &variant_confidence,
+            &months,
+            &days,
+            &timestamps,
+            &settings,
+        )[0];
+        assert!((variant - expected).abs() < 1e-9);
+    }
+
+    assert!(robustness_net_profit(
+        &close,
+        &high,
+        &low,
+        &signals,
+        &confidences[..3],
+        &months,
+        &days,
+        &timestamps,
+        &settings,
+    )
+    .is_none());
 }
 
 #[test]

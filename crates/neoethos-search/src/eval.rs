@@ -1193,6 +1193,48 @@ pub fn simulate_trades_core(
     signals: &[i8],
     settings: &BacktestSettings,
 ) -> Vec<Trade> {
+    simulate_trades_core_impl(close, high, low, timestamps, signals, &[], settings)
+}
+
+pub fn simulate_trades_core_with_confidence(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    timestamps: &[i64],
+    signals: &[i8],
+    confidences: &[f32],
+    settings: &BacktestSettings,
+) -> anyhow::Result<Vec<Trade>> {
+    if confidences.len() != signals.len() {
+        anyhow::bail!(
+            "confidence length {} does not match signal length {}",
+            confidences.len(),
+            signals.len()
+        );
+    }
+    if confidences.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("confidence values must be finite");
+    }
+    Ok(simulate_trades_core_impl(
+        close,
+        high,
+        low,
+        timestamps,
+        signals,
+        confidences,
+        settings,
+    ))
+}
+
+fn simulate_trades_core_impl(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    timestamps: &[i64],
+    signals: &[i8],
+    confidences: &[f32],
+    settings: &BacktestSettings,
+) -> Vec<Trade> {
     let n = close
         .len()
         .min(high.len())
@@ -1204,6 +1246,8 @@ pub fn simulate_trades_core(
     }
 
     let initial_balance = settings.initial_equity();
+    let use_risk_sizing = settings.risk_based_sizing && !confidences.is_empty();
+    let mut equity = initial_balance;
     let pip = if settings.pip_value.abs() < 1e-12 {
         1e-12
     } else {
@@ -1218,6 +1262,7 @@ pub fn simulate_trades_core(
     let mut entry_px = 0.0;
     let mut entry_idx = 0usize;
     let mut trail_px = 0.0;
+    let mut pos_lots = 1.0;
     // Per-trade excursions (operator 2026-06-06): MFE/MAE tracked while a position
     // is open, reset at entry, emitted in each Trade record.
     let mut mfe_money = 0.0_f64;
@@ -1255,8 +1300,8 @@ pub fn simulate_trades_core(
                 } else {
                     (entry_px - low[i], high[i] - entry_px)
                 };
-                let fav_money = (fav / pip) * settings.pip_value_per_lot;
-                let adv_money = (adv / pip) * settings.pip_value_per_lot;
+                let fav_money = (fav / pip) * settings.pip_value_per_lot * pos_lots;
+                let adv_money = (adv / pip) * settings.pip_value_per_lot * pos_lots;
                 if fav_money > mfe_money {
                     mfe_money = fav_money;
                 }
@@ -1273,11 +1318,20 @@ pub fn simulate_trades_core(
                     } else {
                         (entry_px - close[i]) / pip * settings.pip_value_per_lot
                     };
-                    let pnl = pnl - settings.commission_per_trade - half_spread_cost;
+                    let pnl = pnl * pos_lots
+                        - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                     let entry_time = timestamps.get(entry_idx).copied().unwrap_or_default();
                     let exit_time = ts;
                     // Phase C.2: apply broker swap + conversion fee.
-                    let pnl = apply_carry_and_fee(pnl, in_pos, entry_time, exit_time, settings);
+                    let pnl = apply_carry_and_fee_scaled(
+                        pnl,
+                        pos_lots,
+                        in_pos,
+                        entry_time,
+                        exit_time,
+                        settings,
+                    );
+                    equity += pnl;
                     let duration_hours = if exit_time >= entry_time {
                         Some((exit_time - entry_time) as f64 / 3_600_000.0)
                     } else {
@@ -1292,7 +1346,8 @@ pub fn simulate_trades_core(
                         mfe: mfe_money,
                         mae: mae_money,
                         r_multiple: pnl
-                            / (settings.sl_pips * settings.pip_value_per_lot).max(1e-9),
+                            / (settings.sl_pips * settings.pip_value_per_lot * pos_lots)
+                                .max(1e-9),
                     });
                     in_pos = 0;
                     continue;
@@ -1391,11 +1446,20 @@ pub fn simulate_trades_core(
             }
 
             if exit {
-                pnl -= settings.commission_per_trade + half_spread_cost;
+                pnl = pnl * pos_lots
+                    - (settings.commission_per_trade + half_spread_cost) * pos_lots;
                 let entry_time = timestamps.get(entry_idx).copied().unwrap_or_default();
                 let exit_time = timestamps.get(i).copied().unwrap_or(entry_time);
                 // Phase C.2: apply broker swap + conversion fee.
-                let pnl = apply_carry_and_fee(pnl, in_pos, entry_time, exit_time, settings);
+                let pnl = apply_carry_and_fee_scaled(
+                    pnl,
+                    pos_lots,
+                    in_pos,
+                    entry_time,
+                    exit_time,
+                    settings,
+                );
+                equity += pnl;
                 let duration_hours = if exit_time >= entry_time {
                     Some((exit_time - entry_time) as f64 / 3_600_000.0)
                 } else {
@@ -1410,7 +1474,7 @@ pub fn simulate_trades_core(
                     mfe: mfe_money,
                     mae: mae_money,
                     r_multiple: pnl
-                        / (settings.sl_pips * settings.pip_value_per_lot).max(1e-9),
+                        / (settings.sl_pips * settings.pip_value_per_lot * pos_lots).max(1e-9),
                 });
                 in_pos = 0;
             }
@@ -1448,6 +1512,11 @@ pub fn simulate_trades_core(
                 mfe_money = 0.0;
                 mae_money = 0.0;
                 day_trade_count += 1;
+                pos_lots = if use_risk_sizing {
+                    risk_based_pos_lots(confidences[i - 1] as f64, equity, settings)
+                } else {
+                    1.0
+                };
             }
         }
     }
@@ -2489,6 +2558,67 @@ mod overrides_tests {
             "empty confidence slice must force fixed-1-lot, got {}",
             m[0]
         );
+    }
+
+    #[test]
+    fn risk_sized_trade_log_matches_canonical_net_and_rejects_bad_confidence() {
+        let close = vec![1.0000_f64, 1.0000, 0.9900, 0.9900];
+        let high = vec![1.0001_f64; 4];
+        let low = vec![0.9999_f64, 0.9999, 0.9900, 0.9900];
+        let signals = vec![1_i8, 0, 0, 0];
+        let confidences = vec![1.0_f32; 4];
+        let months = vec![0_i64; 4];
+        let days = vec![0_i64; 4];
+        let timestamps: Vec<i64> = (0..4).map(|i| i * 60_000).collect();
+        let mut settings = BacktestSettings::default();
+        settings.sl_pips = 20.0;
+        settings.tp_pips = 10_000.0;
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = true;
+        settings.risk_per_trade_min = 0.01;
+        settings.risk_per_trade_max = 0.01;
+
+        let canonical = fast_evaluate_strategy_core(
+            &close,
+            &high,
+            &low,
+            &signals,
+            &confidences,
+            &months,
+            &days,
+            &timestamps,
+            &settings,
+        )[0];
+        let trade_net: f64 = simulate_trades_core_with_confidence(
+            &close,
+            &high,
+            &low,
+            &timestamps,
+            &signals,
+            &confidences,
+            &settings,
+        )
+        .expect("valid confidence must produce trade log")
+        .iter()
+        .map(|trade| trade.pnl)
+        .sum();
+        assert!((trade_net - canonical).abs() < 1e-9);
+
+        let err = simulate_trades_core_with_confidence(
+            &close,
+            &high,
+            &low,
+            &timestamps,
+            &signals,
+            &confidences[..3],
+            &settings,
+        )
+        .expect_err("missing confidence must fail closed");
+        assert!(err.to_string().contains("confidence length"));
     }
 }
 
@@ -3560,16 +3690,15 @@ mod gpu_cpu_parity_tests {
     /// `[test_start..end]`, ONE population launch over all survivor genes
     /// (`validation_genes_population_window` → `validation_backtest_population`),
     /// keeping the risk diagnostics on the CPU. This test is the easiest parity
-    /// case: the test slice is contiguous (no gather), and the launch is fixed-1-lot
-    /// (`risk_based_sizing == false`, matching the single-gene WF's `&[]` confidence
-    /// at validation.rs:1129-1130).
+    /// case: the test slice is contiguous (no gather), and the launch uses canonical
+    /// risk-based sizing with the same confidence as the single-gene path.
     ///
     /// It asserts BOTH halves of the WF parity claim:
     ///  1. the kernel's RE-SYNTHESIZED signal on `indicators[test_start..end]`
     ///     equals the PRECOMPUTED full-series signal sliced `[test_start..end]`
     ///     (the pointwise-synth-on-a-contiguous-slice insight), and
     ///  2. the population metrics[0/3/4/8] match the per-gene CPU
-    ///     `fast_evaluate_strategy_core` reference (fixed-1-lot, `&[]` confidence)
+    ///     `fast_evaluate_strategy_core` reference (risk-based sizing + confidence)
     ///     within the EXISTING tolerance (`1e-2*|c|.max(1)+1e-3`, trade-count ±1) —
     ///     NOT loosened.
     ///
@@ -3641,9 +3770,7 @@ mod gpu_cpu_parity_tests {
         // 1-minute bars for the timestamp slice (full-length ⇒ passed through).
         let full_timestamps: Vec<i64> = (0..n_samples as i64).map(|i| i * 60_000).collect();
 
-        // Finite cost model. FIXED-1-LOT: risk_based_sizing OFF — the walk-forward's
-        // legacy fixed-1-lot (the single-gene path passes `&[]` confidence so
-        // pos_lots stays 1.0 regardless; the population pack FORCES this flag off).
+        // Finite cost model with canonical Discovery risk-based sizing.
         let mut settings = BacktestSettings::default();
         settings.pip_value = 0.0001;
         settings.pip_value_per_lot = 10.0;
@@ -3653,7 +3780,7 @@ mod gpu_cpu_parity_tests {
         settings.swap_short_pips_per_day = 0.0;
         settings.pnl_conversion_fee_rate = 0.0;
         settings.kill_zones_enabled = false;
-        settings.risk_based_sizing = false; // fixed-1-lot, matching WF `&[]` confidence
+        settings.risk_based_sizing = true;
 
         // Reproduce one walk-forward split's contiguous test window EXACTLY as
         // `embargoed_walkforward_backtest` computes it (train_ratio=0.70, the same
@@ -3679,7 +3806,7 @@ mod gpu_cpu_parity_tests {
         // This is what the single-gene WF path feeds (it slices the precomputed
         // `signals`). The population path RE-SYNTHESIZES from the sliced indicators;
         // both must agree because synth is pointwise.
-        let full_signals_per_gene: Vec<Vec<i8>> = (0..n_genes)
+        let full_signal_confidence_per_gene: Vec<(Vec<i8>, Vec<f32>)> = (0..n_genes)
             .map(|g| {
                 synthesize_signals_and_confidence_cpu(
                     indicators.view(),
@@ -3695,12 +3822,10 @@ mod gpu_cpu_parity_tests {
                     g,
                     n_samples,
                 )
-                .0
             })
             .collect();
 
-        // ── CPU REFERENCE — the single-gene WF slice eval: precomputed signals
-        // sliced contiguously + `&[]` confidence (fixed-1-lot) on the window. ──────
+        // CPU reference: precomputed signals and confidence sliced identically.
         let slice_close = &close[test_start..end];
         let slice_high = &high[test_start..end];
         let slice_low = &low[test_start..end];
@@ -3709,7 +3834,8 @@ mod gpu_cpu_parity_tests {
         let slice_ts = &full_timestamps[test_start..end];
         let cpu: Vec<[f64; 11]> = (0..n_genes)
             .map(|g| {
-                let slice_sig = &full_signals_per_gene[g][test_start..end];
+                let slice_sig = &full_signal_confidence_per_gene[g].0[test_start..end];
+                let slice_conf = &full_signal_confidence_per_gene[g].1[test_start..end];
                 let mut s = settings.clone();
                 s.sl_pips = sl_pips[g];
                 s.tp_pips = tp_pips[g];
@@ -3718,8 +3844,7 @@ mod gpu_cpu_parity_tests {
                     slice_high,
                     slice_low,
                     slice_sig,
-                    // Phase 1 walk-forward: legacy fixed-1-lot `&[]` confidence.
-                    &[],
+                    slice_conf,
                     slice_month,
                     slice_day,
                     slice_ts,
@@ -3737,7 +3862,7 @@ mod gpu_cpu_parity_tests {
         // full-series signals sliced — the core WF parity insight. (CPU synth, so
         // this is device-independent and always runs.)
         for g in 0..n_genes {
-            let (resynth, _conf) = synthesize_signals_and_confidence_cpu(
+            let (resynth, resynth_conf) = synthesize_signals_and_confidence_cpu(
                 win_ind.view(),
                 &gene_offsets,
                 &gene_indices,
@@ -3751,13 +3876,15 @@ mod gpu_cpu_parity_tests {
                 g,
                 win_len,
             );
-            let sliced = &full_signals_per_gene[g][test_start..end];
+            let sliced = &full_signal_confidence_per_gene[g].0[test_start..end];
+            let sliced_conf = &full_signal_confidence_per_gene[g].1[test_start..end];
             assert_eq!(
                 resynth.as_slice(),
                 sliced,
                 "gene {g}: re-synth on the contiguous window != precomputed-signal slice \
                  (walk-forward window-synth not bit-faithful)"
             );
+            assert_eq!(resynth_conf.as_slice(), sliced_conf);
         }
 
         // NEOETHOS_REQUIRE_GPU fail-loud probe (same pattern as the siblings).
@@ -3786,13 +3913,11 @@ mod gpu_cpu_parity_tests {
             if std::env::var("NEOETHOS_REQUIRE_GPU").is_ok() {
                 panic!("NEOETHOS_REQUIRE_GPU set but GPU walk-forward eval failed: {e}");
             }
-            eprintln!("GPU walk-forward parity test SKIPPED (no usable GPU device): {e}");
-            return;
+            eprintln!("GPU unavailable; exercising population CPU fallback: {e}");
         }
 
         // Half (2): population metrics half via the SAME entry the WF window path
-        // uses (`validation_backtest_population`), fixed-1-lot, on the contiguous
-        // slice.
+        // uses (`validation_backtest_population`) on the contiguous slice.
         let gpu = validation_backtest_population(PopulationEvalInputs {
             close: slice_close,
             high: slice_high,

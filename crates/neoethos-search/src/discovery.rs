@@ -1862,6 +1862,44 @@ fn evaluate_robustness_evidence(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+fn robustness_net_profit(
+    close: &[f64],
+    high: &[f64],
+    low: &[f64],
+    signals: &[i8],
+    confidences: &[f32],
+    months: &[i64],
+    days: &[i64],
+    timestamps: &[i64],
+    settings: &crate::eval::BacktestSettings,
+) -> Option<f64> {
+    let n = close.len();
+    if n == 0
+        || high.len() != n
+        || low.len() != n
+        || signals.len() != n
+        || confidences.len() != n
+        || months.len() != n
+        || days.len() != n
+        || timestamps.len() != n
+        || confidences.iter().any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    Some(fast_evaluate_strategy_core(
+        close,
+        high,
+        low,
+        signals,
+        confidences,
+        months,
+        days,
+        timestamps,
+        settings,
+    )[0])
+}
+
 fn retain_aligned<T>(items: &mut Vec<T>, keep: &[bool]) {
     if items.len() != keep.len() {
         items.clear();
@@ -2358,6 +2396,25 @@ fn build_discovery_validation_artifacts(
         .map(|gene| discovery_backtest_settings(config, gene, ohlcv.close.last().copied()))
         .collect();
     let wf_eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let mut portfolio_confidences = Vec::with_capacity(portfolio.len());
+    for ((gene, expected_signals), index) in portfolio
+        .iter()
+        .zip(portfolio_signals)
+        .zip(0usize..)
+    {
+        let (signals, confidences) =
+            signals_and_confidence_for_gene_full(features, ohlcv, gene, &wf_eval_config);
+        if signals != *expected_signals
+            || confidences.len() != n
+            || confidences.iter().any(|value| !value.is_finite())
+        {
+            anyhow::bail!(
+                "walk-forward confidence generation mismatch for portfolio strategy {}",
+                index
+            );
+        }
+        portfolio_confidences.push(confidences);
+    }
     let wf_full_indicators = features.as_indicators_view();
     let (wob, wfvg, wliq, wtrend, wprem, wind, wbos, wchoch, weqh, weql, wdisp) =
         build_smc_arrays(features, ohlcv);
@@ -2391,9 +2448,10 @@ fn build_discovery_validation_artifacts(
             max_daily_profit_pct: 0.0,
             min_trading_days: 0,
             max_trades_per_day: 0,
-            initial_balance: config.initial_balance,
+            initial_balance: wf_settings_template.initial_equity(),
         },
         portfolio_signals,
+        &portfolio_confidences,
         |test_start, end| {
             // ONE GPU population launch over the whole portfolio on this
             // contiguous split window. Serialize the device launch behind
@@ -2425,28 +2483,22 @@ fn build_discovery_validation_artifacts(
         );
     }
 
-    for ((gene, signals), walkforward_summary) in portfolio
+    for (((gene, signals), confidences), walkforward_summary) in portfolio
         .iter()
         .zip(portfolio_signals)
+        .zip(&portfolio_confidences)
         .zip(walkforward_summaries)
     {
         let settings = discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
         let strategy_hash = stable_json_hash(gene)?;
         strategy_hashes.push(strategy_hash.clone());
         let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-        // Regenerate per-bar confidence for risk-based, confidence-scaled
-        // sizing. We reuse the precomputed `signals` for the signal vector
-        // (identity-preserving) and only take the fresh confidence slice —
-        // both are produced from the SAME gene + evaluation config, so they
-        // are aligned by construction.
-        let (_regen_signals, confidences) =
-            signals_and_confidence_for_gene_full(features, ohlcv, gene, &wf_eval_config);
         let metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
             &ohlcv.close,
             &ohlcv.high,
             &ohlcv.low,
             signals,
-            &confidences,
+            confidences,
             &months,
             &days,
             timestamps,
@@ -4677,15 +4729,21 @@ where
     //     sits on a performance PLATEAU (variants keep ≥30% of the real net);
     //     an overfit one falls off a cliff → drop the gene.
     //
-    if !fallback_mode && !portfolio.is_empty() && portfolio_signals.len() == portfolio.len() {
+    if !fallback_mode
+        && !portfolio.is_empty()
+        && portfolio_signals.len() == portfolio.len()
+        && features.timestamps.len() == ohlcv.close.len()
+    {
         use rand::SeedableRng;
         use rand::seq::SliceRandom;
         use rayon::prelude::*;
 
         let n_all = ohlcv.close.len();
         let w0 = n_all.saturating_sub(ROBUST_WINDOW);
-        let ts_all: &[i64] = ohlcv.timestamp.as_deref().unwrap_or(&[]);
-        let ts_win: &[i64] = if ts_all.len() == n_all { &ts_all[w0..] } else { &[] };
+        let (months, days) = month_day_indices(&features.timestamps);
+        let ts_win = &features.timestamps[w0..];
+        let months_win = &months[w0..];
+        let days_win = &days[w0..];
         let eval_cfg_rb = config.evaluation_config(ohlcv.close.last().copied());
 
         let verdicts: Vec<(RobustnessGateResult, String)> = portfolio
@@ -4695,27 +4753,35 @@ where
                 let settings =
                     discovery_backtest_settings(config, gene, ohlcv.close.last().copied());
                 let sig_full = &portfolio_signals[gi];
-                if sig_full.len() != n_all {
+                let (regen_signals, conf_full) =
+                    signals_and_confidence_for_gene_full(features, ohlcv, gene, &eval_cfg_rb);
+                if sig_full.len() != n_all
+                    || regen_signals != *sig_full
+                    || conf_full.len() != n_all
+                    || conf_full.iter().any(|value| !value.is_finite())
+                {
                     return (
                         evaluate_robustness_evidence(0.0, 0, None, &[]),
-                        "rejected (signal length mismatch)".to_string(),
+                        "rejected (signal/confidence mismatch)".to_string(),
                     );
                 }
                 let sig_win = &sig_full[w0..];
-                let net_of = |sigs: &[i8]| -> f64 {
-                    simulate_trades_core(
+                let conf_win = &conf_full[w0..];
+                let net_of = |sigs: &[i8], confidences: &[f32]| -> f64 {
+                    robustness_net_profit(
                         &ohlcv.close[w0..],
                         &ohlcv.high[w0..],
                         &ohlcv.low[w0..],
-                        ts_win,
                         sigs,
+                        confidences,
+                        months_win,
+                        days_win,
+                        ts_win,
                         &settings,
                     )
-                    .iter()
-                    .map(|t| t.pnl)
-                    .sum()
+                    .unwrap_or(f64::NAN)
                 };
-                let real_net = net_of(sig_win);
+                let real_net = net_of(sig_win, conf_win);
                 let signal_bars = sig_win.iter().filter(|s| **s != 0).count();
                 if real_net <= 0.0 || signal_bars < 30 {
                     return (
@@ -4729,10 +4795,16 @@ where
                     ^ (gi as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                 let mut permutation_nets = Vec::with_capacity(N_PERMUTATIONS);
-                let mut shuffled: Vec<i8> = sig_win.to_vec();
+                let mut shuffled: Vec<(i8, f32)> = sig_win
+                    .iter()
+                    .copied()
+                    .zip(conf_win.iter().copied())
+                    .collect();
                 for _ in 0..N_PERMUTATIONS {
                     shuffled.shuffle(&mut rng);
-                    permutation_nets.push(net_of(&shuffled));
+                    let (shuffled_signals, shuffled_confidences): (Vec<_>, Vec<_>) =
+                        shuffled.iter().copied().unzip();
+                    permutation_nets.push(net_of(&shuffled_signals, &shuffled_confidences));
                 }
                 let permutation = evaluate_robustness_evidence(
                     real_net,
@@ -4756,11 +4828,20 @@ where
                     let mut variant = gene.clone();
                     variant.long_threshold *= factor;
                     variant.short_threshold *= factor;
-                    let sig_v = signals_for_gene_full(features, ohlcv, &variant, &eval_cfg_rb);
-                    if sig_v.len() != n_all {
+                    let (sig_v, conf_v) = signals_and_confidence_for_gene_full(
+                        features,
+                        ohlcv,
+                        &variant,
+                        &eval_cfg_rb,
+                    );
+                    if sig_v.len() != n_all
+                        || conf_v.len() != n_all
+                        || conf_v.iter().any(|value| !value.is_finite())
+                    {
                         plateau_variant_nets.push(None);
                     } else {
-                        plateau_variant_nets.push(Some(net_of(&sig_v[w0..])));
+                        plateau_variant_nets
+                            .push(Some(net_of(&sig_v[w0..], &conf_v[w0..])));
                     }
                 }
                 let result = evaluate_robustness_evidence(

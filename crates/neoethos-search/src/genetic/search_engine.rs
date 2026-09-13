@@ -774,7 +774,7 @@ pub fn validation_genes_population_gathered(
 /// This is the gene axis of the walk-forward transpose: the CSR genome arrays,
 /// the per-gene SL/TP (same finite-positive-else-20/40 fallback the rest of the
 /// validation tail uses), the per-gene SMC flags, the SMC weights, and the
-/// fixed-1-lot settings template. None of these depend on which split window is
+/// canonical settings template. None of these depend on which split window is
 /// being evaluated.
 pub struct WalkforwardPopulationGenePack {
     offsets: Vec<i32>,
@@ -787,9 +787,7 @@ pub struct WalkforwardPopulationGenePack {
     gene_smc_flags: Vec<crate::eval::SmcRow>,
     smc_weights: [f32; 11],
     gate_threshold: f32,
-    /// Settings template with `risk_based_sizing` FORCED to `false` — the
-    /// fixed-1-lot semantics the single-gene walk-forward uses (`&[]` confidence
-    /// at validation.rs:1129-1130).
+    /// Canonical Discovery settings, including risk-based sizing.
     settings: BacktestSettings,
     n_genes: usize,
 }
@@ -797,10 +795,8 @@ pub struct WalkforwardPopulationGenePack {
 impl WalkforwardPopulationGenePack {
     /// Build the gene-derived arrays ONCE for the walk-forward population.
     ///
-    /// `settings_template` is cloned and FORCED to fixed-1-lot
-    /// (`risk_based_sizing = false`) so the GPU metrics match the single-gene
-    /// walk-forward's legacy fixed-1-lot backtest, regardless of what the caller
-    /// passes (belt-and-suspenders, mirroring [`validation_genes_population`]).
+    /// `settings_template` is cloned unchanged so walk-forward uses the same
+    /// sizing and cost semantics as GA and canonical Discovery evaluation.
     pub fn new(genes: &[Gene], config: &EvaluationConfig, settings_template: &BacktestSettings) -> Self {
         let (offsets, indices, weights, long_thr, short_thr) = build_gene_arrays(genes);
         let mut sl_pips = Vec::with_capacity(genes.len());
@@ -846,8 +842,6 @@ impl WalkforwardPopulationGenePack {
             config.smc_weight_eql,
             config.smc_weight_displacement,
         ];
-        let mut settings = settings_template.clone();
-        settings.risk_based_sizing = false;
         Self {
             offsets,
             indices,
@@ -859,7 +853,7 @@ impl WalkforwardPopulationGenePack {
             gene_smc_flags,
             smc_weights,
             gate_threshold: config.smc_gate_threshold,
-            settings,
+            settings: settings_template.clone(),
             n_genes: genes.len(),
         }
     }
@@ -881,15 +875,14 @@ impl WalkforwardPopulationGenePack {
 ///
 /// ## Parity with the single-gene walk-forward
 /// The single-gene path slices the PRECOMPUTED full-series `signals[a..b]` and
-/// backtests them with `&[]` confidence (fixed-1-lot). Here the kernel
+/// backtests them with their precomputed confidence. Here the kernel
 /// RE-SYNTHESIZES the signal from `indicators[.., a..b]` + `smc[a..b]`. Signal
 /// synthesis is fully POINTWISE (the SMC arrays carry lookback but are
 /// precomputed on the full series and then sliced, never recomputed on the
 /// slice), so the on-device synth at slice position `k` reads the SAME
 /// indicator + SMC values the full-series synth read at bar `a + k` → identical
-/// per-bar signal → identical metrics. `risk_based_sizing` is forced `false`
-/// (in [`WalkforwardPopulationGenePack::new`]) so sizing is fixed-1-lot, and
-/// `timestamps[a..b]` is passed through so gap/session logic matches the slice.
+/// per-bar signal and confidence → identical metrics. `timestamps[a..b]` is
+/// passed through so gap/session logic matches the slice.
 ///
 /// Returns one `[f64; 11]` metric row per gene (same order as the pack's genes).
 #[allow(clippy::too_many_arguments)]

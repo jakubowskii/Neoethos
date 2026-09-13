@@ -1,6 +1,7 @@
 use crate::artifact_io::{read_json, stable_json_hash, write_json_atomic};
 use crate::eval::{
-    BacktestMetrics, BacktestSettings, fast_evaluate_strategy_core, simulate_trades_core,
+    BacktestMetrics, BacktestSettings, fast_evaluate_strategy_core,
+    simulate_trades_core_with_confidence,
 };
 use anyhow::{Result, bail};
 use itertools::Itertools;
@@ -844,6 +845,7 @@ pub struct WalkforwardBacktestInput<'a> {
     pub high: &'a [f64],
     pub low: &'a [f64],
     pub signals: &'a [i8],
+    pub confidences: &'a [f32],
     pub months: &'a [i64],
     pub days: &'a [i64],
     /// Real bar timestamps (ms or ns, same unit as `simulate_trades_core` expects).
@@ -910,6 +912,7 @@ fn walkforward_risk_diagnostics(
     high: &[f64],
     low: &[f64],
     signals: &[i8],
+    confidences: &[f32],
     days: &[i64],
     timestamps: &[i64],
     settings: &BacktestSettings,
@@ -919,9 +922,9 @@ fn walkforward_risk_diagnostics(
     min_trading_days: usize,
     max_trades_per_day: usize,
     initial_balance: f64,
-) -> WalkforwardRiskDiagnostics {
+) -> Result<WalkforwardRiskDiagnostics> {
     if close.is_empty() || days.is_empty() {
-        return WalkforwardRiskDiagnostics::default();
+        return Ok(WalkforwardRiskDiagnostics::default());
     }
     let initial_balance = if initial_balance.is_finite() && initial_balance > 0.0 {
         initial_balance
@@ -947,7 +950,15 @@ fn walkforward_risk_diagnostics(
     } else {
         days
     };
-    let trades = simulate_trades_core(close, high, low, ts, signals, settings);
+    let trades = simulate_trades_core_with_confidence(
+        close,
+        high,
+        low,
+        ts,
+        signals,
+        confidences,
+        settings,
+    )?;
     let mut max_consec_losses = 0usize;
     let mut current_consec_losses = 0usize;
 
@@ -1016,7 +1027,7 @@ fn walkforward_risk_diagnostics(
         && !trade_limit_violation
         && min_trading_days_ok;
 
-    WalkforwardRiskDiagnostics {
+    Ok(WalkforwardRiskDiagnostics {
         max_consec_losses,
         daily_min_dd,
         max_daily_loss,
@@ -1027,7 +1038,7 @@ fn walkforward_risk_diagnostics(
         daily_returns,
         max_daily_dd_pct: max_daily_loss,
         prop_compliant,
-    }
+    })
 }
 
 pub fn embargoed_walkforward_backtest(
@@ -1038,6 +1049,7 @@ pub fn embargoed_walkforward_backtest(
         high,
         low,
         signals,
+        confidences,
         months,
         days,
         timestamps,
@@ -1056,10 +1068,17 @@ pub fn embargoed_walkforward_backtest(
         || high.len() != n
         || low.len() != n
         || signals.len() != n
+        || confidences.len() != n
         || months.len() != n
         || days.len() != n
     {
         bail!("empty data or length mismatch");
+    }
+    if confidences.iter().any(|value| !value.is_finite()) {
+        bail!("walk-forward confidence values must be finite");
+    }
+    if initial_balance.to_bits() != settings.initial_equity().to_bits() {
+        bail!("walk-forward initial balance must match canonical backtest settings");
     }
     if n_splits == 0 {
         bail!("n_splits must be greater than zero");
@@ -1098,7 +1117,7 @@ pub fn embargoed_walkforward_backtest(
     } else {
         (0..n_splits)
             .into_par_iter()
-            .filter_map(|i| {
+            .map(|i| -> Result<Option<WalkforwardSplitResult>> {
                 let start = i * window;
                 let end = ((i + 1) * window).min(n);
 
@@ -1106,13 +1125,14 @@ pub fn embargoed_walkforward_backtest(
                 let test_start = train_end + embargo_bars;
 
                 if test_start >= end || (train_end - start) < 40 || (end - test_start) < 40 {
-                    return None;
+                    return Ok(None);
                 }
 
                 let slice_close = &close[test_start..end];
                 let slice_high = &high[test_start..end];
                 let slice_low = &low[test_start..end];
                 let slice_sig = &signals[test_start..end];
+                let slice_conf = &confidences[test_start..end];
                 let slice_months = &months[test_start..end];
                 let slice_days = &days[test_start..end];
                 let slice_ts = if timestamps.len() == n {
@@ -1126,11 +1146,10 @@ pub fn embargoed_walkforward_backtest(
                     slice_high,
                     slice_low,
                     slice_sig,
-                    // Phase 1: legacy fixed-1-lot for the walk-forward slice eval.
-                    &[],
+                    slice_conf,
                     slice_months,
                     slice_days,
-                    &[],
+                    slice_ts,
                     settings,
                 );
 
@@ -1145,6 +1164,7 @@ pub fn embargoed_walkforward_backtest(
                     slice_high,
                     slice_low,
                     slice_sig,
+                    slice_conf,
                     slice_days,
                     slice_ts,
                     settings,
@@ -1154,9 +1174,9 @@ pub fn embargoed_walkforward_backtest(
                     min_trading_days,
                     max_trades_per_day,
                     initial_balance,
-                );
+                )?;
 
-                Some(WalkforwardSplitResult {
+                Ok(Some(WalkforwardSplitResult {
                     split: i + 1,
                     trades: trade_count,
                     pnl: net_profit,
@@ -1172,8 +1192,11 @@ pub fn embargoed_walkforward_backtest(
                     daily_returns: risk.daily_returns,
                     max_daily_dd_pct: risk.max_daily_dd_pct,
                     prop_compliant: risk.prop_compliant,
-                })
+                }))
             })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect()
     };
     // par collect preserves range order, but make the ascending-split
@@ -1296,11 +1319,9 @@ pub struct WalkforwardPopulationInput<'a> {
 /// [`summarize_walkforward_splits`] reducer — so the avg/any/all aggregation is
 /// byte-identical to `embargoed_walkforward_backtest`.
 ///
-/// ## Fixed-1-lot
-/// The metrics half MUST be produced with `risk_based_sizing == false` (fixed
-/// 1-lot) and empty (`&[]`) confidence, matching the single-gene WF call at
-/// validation.rs:1129-1130. The caller wires `metrics_fn` to
-/// `validation_genes_population`, which FORCES `risk_based_sizing = false`.
+/// ## Sizing parity
+/// Metrics and CPU risk diagnostics use the same per-gene confidence and
+/// canonical Discovery settings as GA and canonical backtests.
 ///
 /// ## Split-qualification parity
 /// The window size, the 80-bar floor, and the train/embargo validity checks are
@@ -1318,10 +1339,11 @@ pub fn embargoed_walkforward_population<F>(
     // single source of truth for the per-gene signal direction, identical to
     // what the single-gene path slices.
     signals_per_gene: &[Vec<i8>],
+    confidences_per_gene: &[Vec<f32>],
     // Per-window GPU metrics provider: `metrics_fn(test_start, end)` returns one
     // `[f64; 11]` row per gene (same order as `signals_per_gene`) for the
     // contiguous slice `[test_start..end]`. The caller wires this to a single
-    // GPU population launch (fixed-1-lot). Errors propagate (fail-loud).
+    // Population metrics launch. Errors propagate (fail-loud).
     mut metrics_fn: F,
 ) -> Result<Vec<WalkforwardSummary>>
 where
@@ -1357,6 +1379,13 @@ where
             n_genes
         );
     }
+    if confidences_per_gene.len() != n_genes {
+        bail!(
+            "walk-forward population confidences.len()={} != {} genes",
+            confidences_per_gene.len(),
+            n_genes
+        );
+    }
     if let Some((g, s)) = signals_per_gene
         .iter()
         .enumerate()
@@ -1368,6 +1397,23 @@ where
             s.len(),
             n
         );
+    }
+    if let Some((g, c)) = confidences_per_gene
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.len() != n || c.iter().any(|value| !value.is_finite()))
+    {
+        bail!(
+            "walk-forward population confidences[{}] are malformed (len={}, expected {} finite values)",
+            g,
+            c.len(),
+            n
+        );
+    }
+    if gene_settings.iter().any(|settings| {
+        initial_balance.to_bits() != settings.initial_equity().to_bits()
+    }) {
+        bail!("walk-forward initial balance must match canonical backtest settings");
     }
     if n_splits == 0 {
         bail!("n_splits must be greater than zero");
@@ -1415,8 +1461,7 @@ where
             continue;
         }
 
-        // ── GPU half: ONE population launch over all genes on this contiguous
-        //    slice. The caller forces fixed-1-lot / risk_based_sizing=false. ──
+        // ONE population launch over all genes with canonical Discovery sizing.
         let gpu_metrics = metrics_fn(test_start, end)?;
         if gpu_metrics.len() != n_genes {
             bail!(
@@ -1455,6 +1500,7 @@ where
                 let max_daily_dd = m[10];
 
                 let slice_sig = &signals_per_gene[g][test_start..end];
+                let slice_conf = &confidences_per_gene[g][test_start..end];
                 // Per-gene settings (the gene's own SL/TP) so `simulate_trades_core`
                 // inside the diagnostics applies the SAME SL/TP exits the single-gene
                 // path did — byte-identical risk-diagnostic half.
@@ -1463,6 +1509,7 @@ where
                     slice_high,
                     slice_low,
                     slice_sig,
+                    slice_conf,
                     slice_days,
                     slice_ts,
                     &gene_settings[g],
@@ -1472,9 +1519,9 @@ where
                     min_trading_days,
                     max_trades_per_day,
                     initial_balance,
-                );
+                )?;
 
-                WalkforwardSplitResult {
+                Ok(WalkforwardSplitResult {
                     split: i + 1,
                     trades: trade_count,
                     pnl: net_profit,
@@ -1490,9 +1537,9 @@ where
                     daily_returns: risk.daily_returns,
                     max_daily_dd_pct: risk.max_daily_dd_pct,
                     prop_compliant: risk.prop_compliant,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         for (g, r) in split_results.into_iter().enumerate() {
             per_gene_splits[g].push(r);
@@ -1691,6 +1738,7 @@ mod tests {
         let high = close;
         let low = close;
         let signals = [1, 0, 1, 0, 1, 0, 0];
+        let confidences = [1.0_f32; 7];
         let days = [1, 1, 1, 2, 2, 2, 2];
 
         let risk = walkforward_risk_diagnostics(
@@ -1698,6 +1746,7 @@ mod tests {
             &high,
             &low,
             &signals,
+            &confidences,
             &days,
             &days,
             &flat_settings(),
@@ -1707,7 +1756,8 @@ mod tests {
             3,
             1,
             100_000.0,
-        );
+        )
+        .expect("valid confidence must produce diagnostics");
 
         assert_eq!(risk.max_consec_losses, 2);
         assert!(risk.daily_loss_breach);
@@ -1716,6 +1766,88 @@ mod tests {
         assert!(!risk.min_trading_days_ok);
         assert!(!risk.prop_compliant);
         assert_eq!(risk.daily_returns.len(), 2);
+    }
+
+    #[test]
+    fn walkforward_uses_canonical_risk_sizing_and_rejects_missing_confidence() {
+        let n = 200usize;
+        let close = vec![1.0_f64; n];
+        let high = vec![1.0001_f64; n];
+        let mut low = vec![0.9999_f64; n];
+        low[102] = 0.9900;
+        let mut signals = vec![0_i8; n];
+        signals[100] = 1;
+        let confidences = vec![1.0_f32; n];
+        let months = vec![0_i64; n];
+        let days = vec![0_i64; n];
+        let timestamps: Vec<i64> = (0..n as i64).map(|i| i * 60_000).collect();
+        let mut settings = BacktestSettings::default();
+        settings.sl_pips = 20.0;
+        settings.tp_pips = 10_000.0;
+        settings.pip_value = 0.0001;
+        settings.pip_value_per_lot = 10.0;
+        settings.spread_pips = 0.0;
+        settings.commission_per_trade = 0.0;
+        settings.kill_zones_enabled = false;
+        settings.risk_based_sizing = true;
+        settings.risk_per_trade_min = 0.01;
+        settings.risk_per_trade_max = 0.01;
+        macro_rules! input {
+            ($confidence:expr) => {
+                WalkforwardBacktestInput {
+                    close: &close,
+                    high: &high,
+                    low: &low,
+                    signals: &signals,
+                    confidences: $confidence,
+                    months: &months,
+                    days: &days,
+                    timestamps: &timestamps,
+                    train_ratio: 0.5,
+                    n_splits: 1,
+                    embargo_bars: 0,
+                    settings: &settings,
+                    max_daily_loss_pct: 0.0,
+                    max_daily_profit_pct: 0.0,
+                    min_trading_days: 0,
+                    max_trades_per_day: 0,
+                    initial_balance: settings.initial_equity(),
+                }
+            };
+        }
+
+        let summary = embargoed_walkforward_backtest(input!(&confidences))
+            .expect("walk-forward must accept canonical confidence");
+        let test_start = n / 2;
+        let canonical = fast_evaluate_strategy_core(
+            &close[test_start..],
+            &high[test_start..],
+            &low[test_start..],
+            &signals[test_start..],
+            &confidences[test_start..],
+            &months[test_start..],
+            &days[test_start..],
+            &timestamps[test_start..],
+            &settings,
+        )[0];
+        let fixed = fast_evaluate_strategy_core(
+            &close[test_start..],
+            &high[test_start..],
+            &low[test_start..],
+            &signals[test_start..],
+            &[],
+            &months[test_start..],
+            &days[test_start..],
+            &timestamps[test_start..],
+            &settings,
+        )[0];
+        assert_eq!(summary.splits.len(), 1);
+        assert!((summary.splits[0].pnl - canonical).abs() < 1e-9);
+        assert!((canonical - fixed).abs() > 1.0);
+
+        let err = embargoed_walkforward_backtest(input!(&confidences[..n - 1]))
+            .expect_err("missing confidence must fail closed");
+        assert!(err.to_string().contains("length mismatch"));
     }
 
     #[test]
