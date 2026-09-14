@@ -252,6 +252,84 @@ fn cached_and_non_cached_ga_use_explicit_initial_equity() {
     assert!((at_100k[0][0] - non_cached[0][0] * 4.0).abs() < 1e-6);
 }
 
+#[test]
+fn validation_population_honors_discovery_risk_sizing_and_initial_equity() {
+    let (features, ohlcv, gene) = ga_equity_fixture();
+    let config_25k = equity_test_config(25_000.0);
+    let evaluation = config_25k.evaluation_config(Some(1.0));
+    let mut settings_25k = discovery_backtest_settings(&config_25k, &gene, Some(1.0));
+    settings_25k.risk_per_trade_min = 0.005;
+    settings_25k.risk_per_trade_max = 0.015;
+    settings_25k.high_quality_confidence = 1.0;
+
+    let risk_25k = crate::genetic::validation_genes_population(
+        &features, &ohlcv, std::slice::from_ref(&gene), &evaluation, &settings_25k,
+    ).expect("risk-sized validation population")[0];
+    let (signals, confidences) = signals_and_confidence_for_gene_full(
+        &features, &ohlcv, &gene, &evaluation,
+    );
+    assert_eq!(confidences[0], 0.5);
+    let (months, days) = month_day_indices(&features.timestamps);
+    let canonical = fast_evaluate_strategy_core(
+        &ohlcv.close, &ohlcv.high, &ohlcv.low, &signals, &confidences,
+        &months, &days, &features.timestamps, &settings_25k,
+    );
+    assert!((risk_25k[0] - canonical[0]).abs() < 1e-9);
+    assert!((risk_25k[0] + 250.0).abs() < 1e-6);
+
+    let mut fixed_settings = settings_25k.clone();
+    fixed_settings.risk_based_sizing = false;
+    let fixed = crate::genetic::validation_genes_population(
+        &features, &ohlcv, std::slice::from_ref(&gene), &evaluation, &fixed_settings,
+    ).expect("fixed-lot validation population")[0];
+    assert!((fixed[0] + 200.0).abs() < 1e-9);
+    assert!((risk_25k[0] - fixed[0]).abs() > 1.0);
+
+    let config_100k = equity_test_config(100_000.0);
+    let evaluation_100k = config_100k.evaluation_config(Some(1.0));
+    let mut settings_100k = discovery_backtest_settings(&config_100k, &gene, Some(1.0));
+    settings_100k.risk_per_trade_min = 0.005;
+    settings_100k.risk_per_trade_max = 0.015;
+    settings_100k.high_quality_confidence = 1.0;
+    let risk_100k = crate::genetic::validation_genes_population(
+        &features, &ohlcv, &[gene], &evaluation_100k, &settings_100k,
+    ).expect("100k risk-sized validation population")[0];
+    assert!((risk_100k[0] + 1_000.0).abs() < 1e-6);
+    assert!((risk_100k[0] - 4.0 * risk_25k[0]).abs() < 1e-6);
+}
+
+#[test]
+fn validation_population_preserves_fixed_lot_and_per_gene_stops_targets() {
+    let (features, mut ohlcv, base_gene) = ga_equity_fixture();
+    let config = equity_test_config(25_000.0);
+    let evaluation = config.evaluation_config(Some(1.0));
+    let mut settings = discovery_backtest_settings(&config, &base_gene, Some(1.0));
+    settings.risk_based_sizing = false;
+
+    let mut explicit_sl = base_gene.clone();
+    explicit_sl.sl_pips = 10.0;
+    let mut fallback_sl = base_gene.clone();
+    fallback_sl.sl_pips = f64::NAN;
+    let losses = crate::genetic::validation_genes_population(
+        &features, &ohlcv, &[explicit_sl, fallback_sl], &evaluation, &settings,
+    ).expect("per-gene stop validation");
+    assert!((losses[0][0] + 100.0).abs() < 1e-9);
+    assert!((losses[1][0] + 200.0).abs() < 1e-9);
+
+    ohlcv.low.fill(0.9999);
+    ohlcv.high[2] = 1.01;
+    let mut explicit_tp = base_gene.clone();
+    explicit_tp.sl_pips = 1_000.0;
+    explicit_tp.tp_pips = 10.0;
+    let mut fallback_tp = explicit_tp.clone();
+    fallback_tp.tp_pips = f64::NAN;
+    let gains = crate::genetic::validation_genes_population(
+        &features, &ohlcv, &[explicit_tp, fallback_tp], &evaluation, &settings,
+    ).expect("per-gene target validation");
+    assert!((gains[0][0] - 100.0).abs() < 1e-9);
+    assert!((gains[1][0] - 400.0).abs() < 1e-9);
+}
+
 fn profitable_gene(strategy_id: &str) -> Gene {
     Gene {
         strategy_id: strategy_id.to_string(),

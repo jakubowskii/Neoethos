@@ -4366,9 +4366,8 @@ where
                 // (long_threshold → short_threshold → each weight → sl_pips? →
                 // tp_pips?), so the batched run reproduces the old serial run
                 // bit-for-bit and is reproducible CPU↔GPU. The pass test
-                // `metrics[run][0] > 0.0` (net_profit) is the trade-pnl sum
-                // (fixed-1-lot, `risk_based_sizing == false`), semantically
-                // identical to the old `p_trades.iter().map(|t| t.pnl).sum() > 0.0`.
+                // `metrics[run][0] > 0.0` keeps the existing profitable-run
+                // criterion while using canonical confidence/risk sizing.
                 let mc_runs = config.mc_runs as usize;
                 let mut perturbed_genes: Vec<Gene> = Vec::with_capacity(mc_runs);
                 for run_idx in 0..mc_runs as u64 {
@@ -4398,8 +4397,7 @@ where
                 // the BASE gene only to source the shared cost/pip config; the
                 // per-gene SL/TP is re-resolved inside `validation_genes_population`
                 // from each perturbed gene, matching the serial per-run settings.
-                // `risk_based_sizing` is forced false in the helper so sizing is
-                // fixed-1-lot — identical to `simulate_trades_core`.
+                // The helper preserves this template's canonical risk-sizing mode.
                 let mc_settings =
                     discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
                 let mc_metrics = {

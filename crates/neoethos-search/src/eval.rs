@@ -3327,7 +3327,7 @@ mod gpu_cpu_parity_tests {
     ///
     /// The discovery quality screen used to run, per surviving candidate, a
     /// SERIAL loop of `mc_runs` perturbations: each perturbed gene → SMC-gated
-    /// signal → `simulate_trades_core` (fixed-1-lot) → count `pnl_sum > 0`. Stage A
+    /// signal+confidence → canonical backtest → count `net_profit > 0`. Stage A
     /// replaces that with ONE batched `validation_backtest_population` launch over
     /// the `mc_runs` perturbed genes and counts `metrics[run][0] > 0.0`. The two
     /// must report the SAME profitable-run COUNT.
@@ -3336,10 +3336,8 @@ mod gpu_cpu_parity_tests {
     ///  1. RNG determinism — the perturbed genes are built with a `ChaCha8Rng`
     ///     seeded per `(combo, candidate, run)` (exactly as the discovery loop now
     ///     does), so the batched run is reproducible and CPU==GPU on the same seeds.
-    ///  2. Pass-test equivalence — `metrics[0] > 0.0` (net_profit, fixed-1-lot)
-    ///     equals `simulate_trades_core(...).iter().map(|t| t.pnl).sum() > 0.0`
-    ///     because with `risk_based_sizing == false` net_profit IS the fixed-1-lot
-    ///     trade-pnl sum.
+    ///  2. Pass-test equivalence — `metrics[0] > 0.0` equals the canonical
+    ///     confidence/risk-sized CPU net-profit sign.
     ///
     /// The only consumed signal is the SIGN of net_profit, so the COUNT is asserted
     /// EXACT-equal with a ±1 tolerance for the sole edge case (a run whose net sits
@@ -3379,8 +3377,7 @@ mod gpu_cpu_parity_tests {
         let smc_weights = [0.0f32; 11];
         let gate_threshold = 0.0f32;
 
-        // Fixed-1-lot cost model (mirrors `discovery_backtest_settings` after the
-        // helper forces `risk_based_sizing = false`).
+        // Canonical Discovery cost and confidence/risk-sizing model.
         let mut settings = BacktestSettings::default();
         settings.pip_value = 0.0001;
         settings.pip_value_per_lot = 10.0;
@@ -3390,7 +3387,10 @@ mod gpu_cpu_parity_tests {
         settings.swap_short_pips_per_day = 0.0;
         settings.pnl_conversion_fee_rate = 0.0;
         settings.kill_zones_enabled = false;
-        settings.risk_based_sizing = false; // fixed-1-lot, matching the helper
+        settings.risk_based_sizing = true;
+        settings.risk_per_trade_min = 0.005;
+        settings.risk_per_trade_max = 0.03;
+        settings.high_quality_confidence = 0.65;
 
         // A "base gene": sums features 0+1 (weight 1.0), modest thresholds, finite
         // SL/TP. Each MC run perturbs a clone of this, exactly like the discovery
@@ -3441,12 +3441,12 @@ mod gpu_cpu_parity_tests {
         let gene_smc_flags: Vec<SmcRow> = vec![[0i8; 11]; mc_runs];
 
         // ── SERIAL CPU REFERENCE — the exact old MC path ────────────────────────
-        // Per run: synthesize the SMC-gated signal (the same synth the helper uses
-        // internally), then `simulate_trades_core` (fixed-1-lot) and count pnl>0.
+        // Per run: synthesize the same signal+confidence used by the helper,
+        // then run canonical confidence/risk sizing and count net_profit > 0.
         let mut cpu_profitable = 0usize;
         let mut cpu_net: Vec<f64> = Vec::with_capacity(mc_runs);
         for run in 0..mc_runs {
-            let (signals, _conf) = synthesize_signals_and_confidence_cpu(
+            let (signals, conf) = synthesize_signals_and_confidence_cpu(
                 indicators.view(),
                 &gene_offsets,
                 &gene_indices,
@@ -3463,8 +3463,9 @@ mod gpu_cpu_parity_tests {
             let mut s = settings.clone();
             s.sl_pips = sl_pips[run];
             s.tp_pips = tp_pips[run];
-            let trades =
-                simulate_trades_core(&close, &high, &low, &timestamps, &signals, &s);
+            let trades = simulate_trades_core_with_confidence(
+                &close, &high, &low, &timestamps, &signals, &conf, &s,
+            ).expect("valid Monte Carlo confidence");
             let net: f64 = trades.iter().map(|t| t.pnl).sum();
             cpu_net.push(net);
             if net > 0.0 {

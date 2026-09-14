@@ -464,18 +464,12 @@ pub fn evaluate_genes_cached(
 ///    population → ONE GPU launch, CPU fallback) instead of the GA's CPU+GPU
 ///    *split* [`crate::eval::evaluate_population_core`].
 /// 2. The caller supplies the **exact** [`BacktestSettings`] template the serial
-///    validation path used (e.g. `discovery_backtest_settings`): kill-zones on,
-///    and — critically — `risk_based_sizing == false`, so the kernel uses
-///    fixed-1-lot sizing identical to `simulate_trades_core`. Per-gene `sl_pips`
-///    / `tp_pips` are taken from the gene with the SAME 20/40 fallback
+///    validation path used (e.g. `discovery_backtest_settings`), including its
+///    requested confidence/risk-sizing mode. Per-gene `sl_pips` / `tp_pips` are
+///    taken from the gene with the SAME 20/40 fallback
 ///    `discovery_backtest_settings` applies (NOT the OHLCV-inferred
 ///    `resolve_stop_target_arrays` defaults the GA uses), so the SL/TP exits
 ///    match the serial Monte-Carlo run exactly.
-///
-/// With `risk_based_sizing == false` the returned `metrics[0]` (net_profit) is
-/// the fixed-1-lot trade-pnl sum, so a consumer testing `metrics[g][0] > 0.0`
-/// gets the SAME profitable/not verdict as the serial
-/// `simulate_trades_core(...).iter().map(|t| t.pnl).sum() > 0.0`.
 pub fn validation_genes_population(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -556,13 +550,6 @@ pub fn validation_genes_population(
         config.smc_weight_displacement,
     ];
 
-    // Use the caller's settings verbatim, but FORCE fixed-1-lot sizing so the
-    // metrics[0] sign matches the serial `simulate_trades_core` reference. The
-    // caller is expected to pass `risk_based_sizing == false` already; this is
-    // belt-and-suspenders so a stray template can never silently change sizing.
-    let mut settings = settings_template.clone();
-    settings.risk_based_sizing = false;
-
     Ok(crate::eval::validation_backtest_population(
         crate::eval::PopulationEvalInputs {
             close: &ohlcv.close,
@@ -583,7 +570,7 @@ pub fn validation_genes_population(
             gene_smc_flags: &gene_smc_flags,
             gate_threshold: config.smc_gate_threshold,
             weights: &smc_weights,
-            settings: &settings,
+            settings: settings_template,
         },
     ))
 }
