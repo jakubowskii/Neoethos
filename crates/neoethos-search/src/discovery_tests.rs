@@ -1168,6 +1168,145 @@ fn robustness_paths_use_canonical_risk_sizing_and_reject_bad_confidence() {
     .is_none());
 }
 
+fn post_ga_sizing_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<i64>, Vec<i8>, Vec<f32>, crate::eval::BacktestSettings) {
+    let close = vec![1.0, 1.0, 0.99, 0.99];
+    let high = vec![1.0001; 4];
+    let low = vec![0.9999, 0.9999, 0.99, 0.99];
+    let timestamps = (0..4).map(|i| 1_704_067_200_000 + i * 60_000).collect();
+    let signals = vec![1, 0, 0, 0];
+    let confidences = vec![0.5; 4];
+    let mut settings = discovery_backtest_settings(
+        &equity_test_config(100_000.0),
+        &Gene { sl_pips: 20.0, tp_pips: 10_000.0, ..Gene::default() },
+        Some(1.0),
+    );
+    settings.trailing_enabled = false;
+    (close, high, low, timestamps, signals, confidences, settings)
+}
+
+#[test]
+fn post_ga_quality_metrics_and_regime_use_canonical_sizing() {
+    let (close, high, low, timestamps, signals, confidences, settings) = post_ga_sizing_fixture();
+    let baseline = simulate_post_ga_trades(
+        &close, &high, &low, &timestamps, &signals, &confidences, &settings,
+    ).expect("post-GA baseline");
+    let canonical = crate::eval::simulate_trades_core_with_confidence(
+        &close, &high, &low, &timestamps, &signals, &confidences, &settings,
+    ).expect("canonical confidence simulation");
+    let fixed = simulate_trades_core(&close, &high, &low, &timestamps, &signals, &settings);
+
+    assert_eq!(baseline.len(), 1);
+    assert!((baseline[0].pnl - canonical[0].pnl).abs() < 1e-9);
+    assert!((baseline[0].pnl - fixed[0].pnl).abs() > 1.0);
+
+    let metrics = quality_analyzer_for_config(&equity_test_config(100_000.0))
+        .analyze_strategy("post-ga", &baseline, 100_000.0);
+    assert!((metrics.net_profit - baseline[0].pnl).abs() < 1e-9);
+    assert!((metrics.net_profit - fixed[0].pnl).abs() > 1.0);
+
+    let regime_data = ndarray::Array2::from_shape_vec((4, 2), vec![1.0_f32; 8]).unwrap();
+    let regime_features = FeatureFrame {
+        timestamps,
+        names: vec!["regime_trend_strength".into(), "regime_vol_state".into()],
+        data: neoethos_data::FeatureData::InMemory(regime_data),
+    };
+    assert!(!validate_regime_robustness(&baseline, &regime_features, 100_000.0, 1.0));
+    assert!(validate_regime_robustness(&fixed, &regime_features, 100_000.0, 1.0));
+}
+
+#[test]
+fn post_ga_spread_sensitivity_keeps_stressed_costs_and_confidence() {
+    let (mut close, mut high, low, timestamps, signals, confidences, mut stressed) = post_ga_sizing_fixture();
+    close[2] = 1.01;
+    close[3] = 1.01;
+    high[2] = 1.0101;
+    high[3] = 1.0101;
+    stressed.max_hold_bars = 1;
+    stressed.spread_pips = 2.0;
+    stressed.commission_per_trade = 7.0;
+
+    let sensitivity = simulate_post_ga_trades(
+        &close, &high, &low, &timestamps, &signals, &confidences, &stressed,
+    ).expect("post-GA sensitivity");
+    let direct = crate::eval::simulate_trades_core_with_confidence(
+        &close, &high, &low, &timestamps, &signals, &confidences, &stressed,
+    ).expect("direct stressed simulation");
+    let fixed = simulate_trades_core(&close, &high, &low, &timestamps, &signals, &stressed);
+    let mut no_stress = stressed.clone();
+    no_stress.spread_pips = 0.0;
+    no_stress.commission_per_trade = 0.0;
+    let unstressed = simulate_post_ga_trades(
+        &close, &high, &low, &timestamps, &signals, &confidences, &no_stress,
+    ).expect("unstressed simulation");
+
+    assert!((sensitivity[0].pnl - direct[0].pnl).abs() < 1e-9);
+    assert!((sensitivity[0].pnl - fixed[0].pnl).abs() > 1.0);
+    assert!(sensitivity[0].pnl < unstressed[0].pnl);
+}
+
+#[test]
+fn post_ga_prop_firm_slices_full_confidence_and_fails_closed() {
+    let base = 1_704_067_200_000_i64;
+    let timestamps = vec![base, base + 6 * 3_600_000, base + 12 * 3_600_000, base + 18 * 3_600_000, base + 30 * 3_600_000];
+    let close = vec![1.0; 5];
+    let mut high = vec![1.0001; 5];
+    high[2] = 1.01;
+    let ohlcv = Ohlcv {
+        timestamp: Some(timestamps.clone()), open: close.clone(), high,
+        low: vec![0.9999; 5], close, volume: None,
+    };
+    let signals = vec![1, 0, 0, 0, 0];
+    let confidences = vec![0.5; 5];
+    let gene = Gene { sl_pips: 20.0, tp_pips: 50.0, ..Gene::default() };
+    let config = equity_test_config(100_000.0);
+    let rules = PropFirmRiskRules {
+        max_daily_loss_pct: 0.0, max_overall_drawdown_pct: 0.0,
+        max_profit_consistency_ratio: 0.0, min_trading_days: 0,
+        max_trades_per_day: 0, require_profit_target: true, min_profit_target_pct: 0.02,
+    };
+    let gate = PropFirmGateOverrides { rules, n_windows: 1, window_days: 1, pass_rate: 0.0 };
+
+    let (rate, counted) = compute_prop_firm_pass_rate(
+        &gene, &signals, &confidences, &ohlcv, &timestamps, &config, &gate,
+    ).expect("prop-firm confidence window");
+    let settings = discovery_backtest_settings(&config, &gene, Some(1.0));
+    let direct = crate::eval::simulate_trades_core_with_confidence(
+        &ohlcv.close[..4], &ohlcv.high[..4], &ohlcv.low[..4], &timestamps[..4],
+        &signals[..4], &confidences[..4], &settings,
+    ).expect("direct confidence-sized window");
+    let fixed = simulate_trades_core(
+        &ohlcv.close[..4], &ohlcv.high[..4], &ohlcv.low[..4], &timestamps[..4],
+        &signals[..4], &settings,
+    );
+    assert_eq!((rate, counted), (1.0, 1));
+    assert!(compute_prop_firm_risk_summary(PropFirmRiskInput {
+        trades: &direct, initial_balance: config.initial_balance, rules,
+    }).all_rules_passed);
+    assert!(!compute_prop_firm_risk_summary(PropFirmRiskInput {
+        trades: &fixed, initial_balance: config.initial_balance, rules,
+    }).all_rules_passed);
+
+    assert!(compute_prop_firm_pass_rate(
+        &gene, &signals, &confidences[..4], &ohlcv, &timestamps, &config, &gate,
+    ).is_err());
+    let mut non_finite = confidences;
+    non_finite[0] = f32::NAN;
+    assert!(compute_prop_firm_pass_rate(
+        &gene, &signals, &non_finite, &ohlcv, &timestamps, &config, &gate,
+    ).is_err());
+}
+
+#[test]
+fn generic_trade_simulator_remains_fixed_lot() {
+    let (close, high, low, timestamps, signals, confidences, mut settings) = post_ga_sizing_fixture();
+    settings.risk_based_sizing = false;
+    let generic = simulate_trades_core(&close, &high, &low, &timestamps, &signals, &settings);
+    let explicit = crate::eval::simulate_trades_core_with_confidence(
+        &close, &high, &low, &timestamps, &signals, &confidences, &settings,
+    ).expect("risk sizing disabled");
+    assert!((generic[0].pnl - explicit[0].pnl).abs() < 1e-9);
+}
+
 #[test]
 fn all_robustness_failures_leave_empty_portfolio() {
     let mut portfolio = vec![profitable_gene("alpha-1"), profitable_gene("alpha-2")];

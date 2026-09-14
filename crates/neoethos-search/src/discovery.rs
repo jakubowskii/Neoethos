@@ -1,5 +1,5 @@
 use crate::artifact_io::{stable_json_hash, write_json_atomic};
-use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core};
+use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core, simulate_trades_core_with_confidence};
 use crate::genetic::strategy_gene::{
     EvaluationConfig, MarketCostProfile, resolve_strict_discovery_cost_profile,
 };
@@ -3756,6 +3756,14 @@ fn auto_tune_n_windows(timestamps: &[i64], window_days: usize) -> usize {
     (full_spans * 3).clamp(20, 200)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn simulate_post_ga_trades(
+    close: &[f64], high: &[f64], low: &[f64], timestamps: &[i64], signals: &[i8],
+    confidences: &[f32], settings: &crate::eval::BacktestSettings,
+) -> Result<Vec<Trade>> {
+    simulate_trades_core_with_confidence(close, high, low, timestamps, signals, confidences, settings)
+}
+
 /// Sample roughly evenly-spaced 30-day (configurable) windows from the
 /// dataset history; for each window simulate trades and check the strategy
 /// against `compute_prop_firm_risk_summary`. Return the fraction of
@@ -3767,11 +3775,18 @@ fn auto_tune_n_windows(timestamps: &[i64], window_days: usize) -> usize {
 fn compute_prop_firm_pass_rate(
     gene: &Gene,
     signals: &[i8],
+    confidences: &[f32],
     ohlcv: &Ohlcv,
     timestamps: &[i64],
     config: &DiscoveryConfig,
     overrides: &PropFirmGateOverrides,
-) -> (f64, usize) {
+) -> Result<(f64, usize)> {
+    if confidences.len() != signals.len() {
+        anyhow::bail!("prop-firm signal/confidence length mismatch");
+    }
+    if confidences.iter().any(|value| !value.is_finite()) {
+        anyhow::bail!("prop-firm confidence values must be finite");
+    }
     let n = signals
         .len()
         .min(timestamps.len())
@@ -3779,13 +3794,13 @@ fn compute_prop_firm_pass_rate(
         .min(ohlcv.high.len())
         .min(ohlcv.low.len());
     if n == 0 || overrides.window_days == 0 || overrides.n_windows == 0 {
-        return (0.0, 0);
+        return Ok((0.0, 0));
     }
     let window_ms: i64 = (overrides.window_days as i64) * 86_400_000;
     let first_ts = timestamps[0];
     let last_ts = timestamps[n - 1];
     if last_ts - first_ts < window_ms {
-        return (0.0, 0);
+        return Ok((0.0, 0));
     }
     let max_start_ts = last_ts - window_ms;
     let span = (max_start_ts - first_ts).max(1) as f64;
@@ -3818,7 +3833,8 @@ fn compute_prop_firm_pass_rate(
         let low = &ohlcv.low[start_idx..end_idx];
         let ts = &timestamps[start_idx..end_idx];
         let sig = &signals[start_idx..end_idx];
-        let trades = simulate_trades_core(close, high, low, ts, sig, &settings);
+        let conf = &confidences[start_idx..end_idx];
+        let trades = simulate_post_ga_trades(close, high, low, ts, sig, conf, &settings)?;
         let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
             trades: &trades,
             initial_balance,
@@ -3830,9 +3846,9 @@ fn compute_prop_firm_pass_rate(
         counted += 1;
     }
     if counted == 0 {
-        return (0.0, 0);
+        return Ok((0.0, 0));
     }
-    (passes as f64 / counted as f64, counted)
+    Ok((passes as f64 / counted as f64, counted))
 }
 
 /// AREA 2 / Stage A (2026-06-09) — serializes GPU launches across the
@@ -4174,21 +4190,28 @@ where
     // the min_trades gate so we can tell "no signal" from "too few
     // trades".
     let nonzero_signal_count = std::sync::atomic::AtomicUsize::new(0);
-    let signals_with_idx: Vec<(usize, Gene, Vec<i8>)> = prefiltered
+    let signals_with_idx: Vec<(usize, Gene, (Vec<i8>, Vec<f32>))> = prefiltered
         .into_par_iter()
-        .filter_map(|(candidate_idx, gene)| {
-            let sig = signals_for_gene_full(features, ohlcv, &gene, &eval_config_for_signals);
+        .map(|(candidate_idx, gene)| -> Result<Option<_>> {
+            let (sig, conf) = signals_and_confidence_for_gene_full(features, ohlcv, &gene, &eval_config_for_signals);
+            if sig.len() != features.n_samples() || conf.len() != sig.len() {
+                anyhow::bail!("post-GA signal/confidence length mismatch for {}", gene.strategy_id);
+            }
+            if conf.iter().any(|value| !value.is_finite()) {
+                anyhow::bail!("post-GA confidence contains non-finite values for {}", gene.strategy_id);
+            }
             let trade_count = sig.iter().filter(|v| **v != 0).count() as f64;
             if trade_count > 0.0 {
                 nonzero_signal_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             if trade_count >= min_trades as f64 {
-                Some((candidate_idx, gene, sig))
+                Ok(Some((candidate_idx, gene, (sig, conf))))
             } else {
-                None
+                Ok(None)
             }
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?
+        .into_iter().flatten().collect();
     let post_min_trades = signals_with_idx.len();
     let post_nonzero_signal = nonzero_signal_count.load(std::sync::atomic::Ordering::Relaxed);
     // 2026-05-26: record "any signal at all" + "passed min-trades" as separate
@@ -4205,10 +4228,10 @@ where
     }
     funnel.record_stage("passed_min_trades", post_nonzero_signal, post_min_trades);
     let mut filtered: Vec<(usize, Gene)> = Vec::with_capacity(signals_with_idx.len());
-    let mut signals_map: Vec<Vec<i8>> = Vec::with_capacity(signals_with_idx.len());
-    for (idx, gene, sig) in signals_with_idx {
+    let mut signals_map: Vec<(Vec<i8>, Vec<f32>)> = Vec::with_capacity(signals_with_idx.len());
+    for (idx, gene, signal_data) in signals_with_idx {
         filtered.push((idx, gene));
-        signals_map.push(sig);
+        signals_map.push(signal_data);
     }
 
     // ── PBO candidate snapshot (2026-07-02) ────────────────────────────────
@@ -4246,7 +4269,7 @@ where
         order
             .into_iter()
             .take(FALLBACK_PORTFOLIO_MAX)
-            .map(|i| (filtered[i].clone(), signals_map[i].clone()))
+            .map(|i| (filtered[i].clone(), signals_map[i].0.clone()))
             .collect()
     };
     progress_fn(DiscoveryProgress::CandidatesFiltered {
@@ -4259,7 +4282,7 @@ where
     let mut quality_metrics = Vec::new();
     let mut logged_trades = Vec::new();
     if Gene::requires_quality_screen(&config.filtering) {
-        type QualityCandidate = (usize, Gene, Vec<i8>, StrategyMetrics, bool, Vec<Trade>);
+        type QualityCandidate = (usize, Gene, (Vec<i8>, Vec<f32>), StrategyMetrics, bool, Vec<Trade>);
         let analyzer = quality_analyzer_for_config(config);
         let initial_balance = config.initial_balance;
 
@@ -4294,18 +4317,19 @@ where
         // ONE batched GPU population launch (CPU fallback) per candidate via
         // `validation_genes_population`, replacing the per-run serial
         // `signals_for_gene_full` + `simulate_trades_core`.
-        let pairs: Vec<((usize, Gene), Vec<i8>)> = filtered.into_iter().zip(signals_map).collect();
+        let pairs: Vec<_> = filtered.into_iter().zip(signals_map).collect();
         let screened: Vec<Option<QualityCandidate>> = pairs
             .into_par_iter()
-            .map(|((candidate_idx, gene), sig)| {
-                let trades = crate::eval::simulate_trades_core(
+            .map(|((candidate_idx, gene), (sig, conf))| -> Result<Option<QualityCandidate>> {
+                let trades = simulate_post_ga_trades(
                     &ohlcv.close,
                     &ohlcv.high,
                     &ohlcv.low,
                     &features.timestamps,
                     &sig,
+                    &conf,
                     &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
-                );
+                )?;
                 let metrics =
                     analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
                 let strict_quality = passes_strict_quality(&metrics, &config.filtering);
@@ -4313,7 +4337,7 @@ where
                     !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
 
                 if !(strict_quality || opportunistic_quality) {
-                    return None;
+                    return Ok(None);
                 }
 
                 // Regime-Aware Validation (Idea #3.2)
@@ -4324,7 +4348,7 @@ where
                     config.max_regime_loss_pct,
                 );
                 if !regime_robust {
-                    return None;
+                    return Ok(None);
                 }
 
                 // Monte Carlo Parameter Perturbation Test.
@@ -4405,12 +4429,12 @@ where
                             strategy_id = %gene.strategy_id,
                             "Monte-Carlo batched eval failed — rejecting candidate"
                         );
-                        return None;
+                        return Ok(None);
                     }
                 };
 
                 if (profitable_runs as u32) < config.mc_min_profitable {
-                    return None;
+                    return Ok(None);
                 }
 
                 // Spread/Slippage Sensitivity Test — wired from Settings
@@ -4419,29 +4443,30 @@ where
                     discovery_backtest_settings(config, &gene, ohlcv.close.last().copied());
                 sensitive_settings.spread_pips = config.sensitivity_spread_pips;
                 sensitive_settings.commission_per_trade = config.sensitivity_commission_per_lot;
-                let sens_trades = crate::eval::simulate_trades_core(
+                let sens_trades = simulate_post_ga_trades(
                     &ohlcv.close,
                     &ohlcv.high,
                     &ohlcv.low,
                     &features.timestamps,
                     &sig,
+                    &conf,
                     &sensitive_settings,
-                );
+                )?;
                 let sens_pnl: f64 = sens_trades.iter().map(|t| t.pnl).sum();
                 if sens_pnl < 0.0 {
-                    return None;
+                    return Ok(None);
                 }
 
-                Some((
+                Ok(Some((
                     candidate_idx,
                     gene,
-                    sig,
+                    (sig, conf),
                     metrics,
                     opportunistic_quality,
                     trades,
-                ))
+                )))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let mut strict_passed: Vec<QualityCandidate> = Vec::new();
         let mut opportunistic_passed = 0usize;
@@ -4495,9 +4520,9 @@ where
 
         let mut screened_genes = Vec::with_capacity(strict_passed.len());
         let mut screened_signals = Vec::with_capacity(strict_passed.len());
-        for (candidate_idx, gene, sig, _, _, _) in strict_passed {
+        for (candidate_idx, gene, signal_data, _, _, _) in strict_passed {
             screened_genes.push((candidate_idx, gene));
-            screened_signals.push(sig);
+            screened_signals.push(signal_data);
         }
         filtered = screened_genes;
         signals_map = screened_signals;
@@ -4533,25 +4558,26 @@ where
         // here means BOTH the diagnostic bucket below and the survival filter
         // (`*rate >= pf.pass_rate`) use the floored threshold consistently.
         pf.pass_rate = pf.pass_rate.max(config.prop_firm_min_pass_rate);
-        let candidates_in: Vec<((usize, Gene), Vec<i8>)> =
+        let candidates_in: Vec<((usize, Gene), (Vec<i8>, Vec<f32>))> =
             filtered.into_iter().zip(signals_map.into_iter()).collect();
         let timestamps_owned = features.timestamps.clone();
         let candidates_in_count = candidates_in.len();
         let pf_pass_rate_floor = pf.pass_rate;
-        let scored_all: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = candidates_in
+        let scored_all: Vec<(((usize, Gene), (Vec<i8>, Vec<f32>)), f64, usize)> = candidates_in
             .into_par_iter()
-            .map(|(pair, sig)| {
+            .map(|(pair, (sig, conf))| -> Result<_> {
                 let (rate, counted) = compute_prop_firm_pass_rate(
                     &pair.1,
                     &sig,
+                    &conf,
                     ohlcv,
                     &timestamps_owned,
                     config,
                     &pf,
-                );
-                ((pair, sig), rate, counted)
+                )?;
+                Ok(((pair, (sig, conf)), rate, counted))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         // Diagnostic: bucket what the gate did to each candidate.
         let mut dbg_counted_zero = 0usize;
         let mut dbg_below_pass_rate = 0usize;
@@ -4592,7 +4618,7 @@ where
             timestamps_len = timestamps_owned.len(),
             "prop-firm gate breakdown — why candidates were rejected"
         );
-        let mut scored: Vec<(((usize, Gene), Vec<i8>), f64, usize)> = scored_all
+        let mut scored: Vec<(((usize, Gene), (Vec<i8>, Vec<f32>)), f64, usize)> = scored_all
             .into_iter()
             .filter(|(_, rate, counted)| *counted > 0 && *rate >= pf.pass_rate)
             .collect();
@@ -4609,10 +4635,10 @@ where
                 })
         });
         let mut next_filtered: Vec<(usize, Gene)> = Vec::with_capacity(scored.len());
-        let mut next_signals: Vec<Vec<i8>> = Vec::with_capacity(scored.len());
-        for ((pair, sig), rate, _) in scored {
+        let mut next_signals = Vec::with_capacity(scored.len());
+        for ((pair, signal_data), rate, _) in scored {
             next_filtered.push(pair);
-            next_signals.push(sig);
+            next_signals.push(signal_data);
             prop_firm_pass_rates.push(rate);
         }
         let best_rate = prop_firm_pass_rates.first().copied().unwrap_or(0.0);
@@ -4658,7 +4684,7 @@ where
     let mut portfolio_signals: Vec<Vec<i8>> = Vec::new();
     let mut rejected_by_correlation = 0usize;
     let mut portfolio_pass_rates: Vec<f64> = Vec::new();
-    for (idx, ((_, gene), sig)) in filtered.into_iter().zip(signals_map).enumerate() {
+    for (idx, ((_, gene), (sig, _))) in filtered.into_iter().zip(signals_map).enumerate() {
         if portfolio.len() >= config.portfolio_size {
             break;
         }
