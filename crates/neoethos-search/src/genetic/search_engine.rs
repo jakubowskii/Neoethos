@@ -414,6 +414,7 @@ pub fn evaluate_genes_cached(
     ];
 
     let b_settings = BacktestSettings {
+        initial_equity_override: config.initial_equity_override,
         max_hold_bars: config.max_hold_bars,
         trailing_enabled: config.trailing_enabled,
         trailing_atr_multiplier: config.trailing_atr_multiplier,
@@ -1115,6 +1116,7 @@ pub fn evaluate_genes(
     ];
 
     let b_settings = BacktestSettings {
+        initial_equity_override: config.initial_equity_override,
         max_hold_bars: config.max_hold_bars,
         trailing_enabled: config.trailing_enabled,
         trailing_atr_multiplier: config.trailing_atr_multiplier,

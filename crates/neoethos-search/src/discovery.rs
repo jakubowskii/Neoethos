@@ -524,7 +524,7 @@ impl DiscoveryConfig {
             // raw YAML, not one careless click).
             max_pbo: 0.5,
             filtering,
-            initial_balance: settings.risk.initial_balance.max(1.0),
+            initial_balance: settings.risk.initial_balance,
             max_regime_loss_pct: 3.0,
             higher_timeframes: settings.system.higher_timeframes.clone(),
             runtime_overrides: DiscoveryRuntimeOverrides::from_settings(settings),
@@ -738,6 +738,7 @@ impl DiscoveryConfig {
                 self.evaluation_commission_per_trade,
             ),
         };
+        cfg.initial_equity_override = Some(self.initial_balance);
         // scoring_version 5: Risky discovery evolves under the Kelly
         // log-growth objective — the SAME math its post-GA ranking
         // (`calculate_income_score`) scores with, so the population the
@@ -1298,6 +1299,7 @@ fn discovery_backtest_settings(
 ) -> crate::eval::BacktestSettings {
     let evaluation = config.evaluation_config(price_hint);
     crate::eval::BacktestSettings {
+        initial_equity_override: evaluation.initial_equity_override,
         sl_pips: if gene.sl_pips.is_finite() && gene.sl_pips > 0.0 {
             gene.sl_pips
         } else {
@@ -1577,6 +1579,7 @@ struct DiscoveryLiveReadinessPolicy {
 
 #[derive(Debug, Serialize)]
 struct DiscoveryBacktestPolicy {
+    initial_equity: f64,
     symbol: String,
     account_currency: String,
     timeframe_label: String,
@@ -1673,6 +1676,7 @@ fn discovery_backtest_policy_hash(
     settings: &crate::eval::BacktestSettings,
 ) -> Result<String> {
     stable_json_hash(&DiscoveryBacktestPolicy {
+        initial_equity: settings.initial_equity(),
         symbol: config.evaluation_symbol.clone(),
         account_currency: config.evaluation_account_currency.clone(),
         timeframe_label: config.timeframe_label.clone(),
@@ -2952,6 +2956,11 @@ pub fn run_discovery_cycle_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    if !config.initial_balance.is_finite() || config.initial_balance <= 0.0 {
+        anyhow::bail!(
+            "run_discovery_cycle: DiscoveryConfig.initial_balance must be finite and greater than zero"
+        );
+    }
     // F-304 fix (2026-05-28): pre-flight bail. The cost-model NaN
     // guard at `strategy_gene::infer_market_cost_profile` returns
     // empty-string + NaN-sentinel values when `evaluation_symbol` or

@@ -115,6 +115,7 @@ fn utc_hour_of_day(timestamp_ms: i64) -> u32 {
 
 #[derive(Debug, Clone)]
 pub struct BacktestSettings {
+    pub initial_equity_override: Option<f64>,
     pub sl_pips: f64,
     pub tp_pips: f64,
     pub max_hold_bars: usize,
@@ -307,6 +308,7 @@ impl Default for BacktestSettings {
         // backtests MUST construct via `for_symbol(...)` — see
         // [`BacktestSettings::for_symbol`].
         Self {
+            initial_equity_override: None,
             sl_pips: 20.0,
             tp_pips: 40.0,
             max_hold_bars: 0,
@@ -534,6 +536,12 @@ pub fn current_backtest_runtime_overrides() -> BacktestRuntimeOverrides {
 
 impl BacktestSettings {
     pub fn initial_equity(&self) -> f64 {
+        if let Some(value) = self
+            .initial_equity_override
+            .filter(|value| value.is_finite() && *value > 0.0)
+        {
+            return value;
+        }
         current_backtest_runtime_overrides().initial_equity
     }
 
@@ -2291,8 +2299,24 @@ mod overrides_tests {
         // return the audited defaults rather than reading the environment
         // directly each call.
         let settings = BacktestSettings::default();
-        assert!((settings.initial_equity() - 100_000.0).abs() < 1e-9);
+        assert_eq!(settings.initial_equity_override, None);
+        assert_eq!(
+            settings.initial_equity().to_bits(),
+            current_backtest_runtime_overrides()
+                .initial_equity
+                .to_bits()
+        );
         assert_eq!(settings.month_capacity(), 240);
+    }
+
+    #[test]
+    fn explicit_initial_equity_override_wins_over_runtime_equity() {
+        let settings = BacktestSettings {
+            initial_equity_override: Some(25_000.0),
+            ..BacktestSettings::default()
+        };
+
+        assert_eq!(settings.initial_equity(), 25_000.0);
     }
 
     #[test]
@@ -2534,6 +2558,7 @@ mod overrides_tests {
         risk_min: f64,
         risk_max: f64,
         confidences: &[f32],
+        initial_equity_override: Option<f64>,
     ) -> [f64; 11] {
         let pip = 0.0001_f64;
         let pip_value_per_lot = 10.0_f64;
@@ -2551,6 +2576,7 @@ mod overrides_tests {
         let days = vec![0_i64; 4];
 
         let mut settings = BacktestSettings::default();
+        settings.initial_equity_override = initial_equity_override;
         settings.sl_pips = sl_pips;
         settings.tp_pips = 10_000.0; // never hit
         settings.max_hold_bars = 0; // no max-hold exit
@@ -2584,7 +2610,7 @@ mod overrides_tests {
         // Two DIFFERENT stop distances must yield the SAME % loss, proving
         // the loss is risk-driven and INDEPENDENT of sl_pips.
         for sl_pips in [20.0_f64, 40.0_f64] {
-            let m = run_single_sl_trade(sl_pips, true, risk, risk, &conf);
+            let m = run_single_sl_trade(sl_pips, true, risk, risk, &conf, None);
             let net_profit = m[0];
             let trade_count = m[8];
             assert_eq!(trade_count, 1.0, "expected exactly one trade (sl={sl_pips})");
@@ -2596,6 +2622,16 @@ mod overrides_tests {
     }
 
     #[test]
+    fn risk_sizing_scales_with_explicit_initial_equity() {
+        let confidence = [1.0_f32; 4];
+        let at_25k = run_single_sl_trade(20.0, true, 0.01, 0.01, &confidence, Some(25_000.0));
+        let at_100k = run_single_sl_trade(20.0, true, 0.01, 0.01, &confidence, Some(100_000.0));
+
+        assert!((at_25k[0] + 250.0).abs() < 1e-6);
+        assert!((at_100k[0] + 1_000.0).abs() < 1e-6);
+    }
+
+    #[test]
     fn risk_sizing_disabled_is_legacy() {
         // risk_based_sizing = false → fixed 1 lot. The realized loss must be
         // exactly sl_pips × pip_value_per_lot (the legacy fixed-1-lot path),
@@ -2603,7 +2639,7 @@ mod overrides_tests {
         let pip_value_per_lot = 10.0_f64;
         let conf = vec![1.0_f32; 4]; // ignored when sizing is disabled
         for sl_pips in [20.0_f64, 40.0_f64] {
-            let m = run_single_sl_trade(sl_pips, false, 0.01, 0.01, &conf);
+            let m = run_single_sl_trade(sl_pips, false, 0.01, 0.01, &conf, None);
             let net_profit = m[0];
             let expected = -sl_pips * pip_value_per_lot; // fixed 1 lot
             assert_eq!(m[8], 1.0, "expected exactly one trade (sl={sl_pips})");
@@ -2615,7 +2651,7 @@ mod overrides_tests {
 
         // Also assert that an EMPTY confidence slice forces legacy behaviour
         // even when risk_based_sizing is true.
-        let m = run_single_sl_trade(20.0, true, 0.01, 0.01, &[]);
+        let m = run_single_sl_trade(20.0, true, 0.01, 0.01, &[], None);
         assert!(
             (m[0] - (-20.0 * pip_value_per_lot)).abs() < 1e-9,
             "empty confidence slice must force fixed-1-lot, got {}",

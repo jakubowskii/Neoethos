@@ -118,6 +118,140 @@ fn discovery_strict_profile_reaches_canonical_backtest_settings() {
     assert_eq!(settings.pnl_conversion_fee_rate, profile.pnl_conversion_fee_rate);
 }
 
+fn equity_test_config(initial_balance: f64) -> DiscoveryConfig {
+    DiscoveryConfig {
+        initial_balance,
+        evaluation_symbol: "EURUSD".to_string(),
+        evaluation_account_currency: "USD".to_string(),
+        resolved_market_cost_profile: Some(MarketCostProfile {
+            symbol: "EURUSD".to_string(),
+            account_currency: "USD".to_string(),
+            pip_value: 0.0001,
+            pip_value_per_lot: 10.0,
+            spread_pips: 0.0,
+            commission_per_trade: 0.0,
+            swap_long_pips_per_day: 0.0,
+            swap_short_pips_per_day: 0.0,
+            pnl_conversion_fee_rate: 0.0,
+        }),
+        ..DiscoveryConfig::default()
+    }
+}
+
+#[test]
+fn discovery_equity_reaches_evaluation_and_backtest_settings() {
+    let config = equity_test_config(25_000.0);
+    let evaluation = config.evaluation_config(Some(1.1));
+    let settings = discovery_backtest_settings(&config, &Gene::default(), Some(1.1));
+
+    assert_eq!(evaluation.initial_equity_override, Some(25_000.0));
+    assert_eq!(settings.initial_equity_override, Some(25_000.0));
+    assert_eq!(settings.initial_equity(), 25_000.0);
+}
+
+#[test]
+fn discovery_invalid_initial_balance_fails_before_ga() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    for initial_balance in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+        let config = DiscoveryConfig {
+            initial_balance,
+            ..DiscoveryConfig::default()
+        };
+        let err = run_discovery_cycle(&features, &ohlcv, &config)
+            .expect_err("invalid initial balance must fail before GA");
+        assert!(err.to_string().contains("initial_balance"));
+    }
+
+    let mut settings = neoethos_core::Settings::default();
+    settings.risk.initial_balance = -7.0;
+    assert_eq!(
+        DiscoveryConfig::from_settings(&settings).initial_balance,
+        -7.0
+    );
+}
+
+#[test]
+fn discovery_backtest_policy_hash_includes_initial_equity() {
+    let gene = Gene::default();
+    let config_25k = equity_test_config(25_000.0);
+    let settings_25k = discovery_backtest_settings(&config_25k, &gene, Some(1.1));
+    let hash_25k =
+        discovery_backtest_policy_hash(&config_25k, &gene, &settings_25k).expect("25k policy hash");
+
+    let config_100k = equity_test_config(100_000.0);
+    let settings_100k = discovery_backtest_settings(&config_100k, &gene, Some(1.1));
+    let hash_100k = discovery_backtest_policy_hash(&config_100k, &gene, &settings_100k)
+        .expect("100k policy hash");
+
+    assert_ne!(hash_25k, hash_100k);
+}
+
+fn ga_equity_fixture() -> (FeatureFrame, Ohlcv, Gene) {
+    let n = 100usize;
+    let timestamps: Vec<i64> = (0..n as i64)
+        .map(|index| 1_704_067_200_000 + index * 60_000)
+        .collect();
+    let mut data = ndarray::Array2::<f32>::zeros((n, 1));
+    data[[0, 0]] = 1.0;
+    let features = FeatureFrame {
+        timestamps: timestamps.clone(),
+        names: vec!["signal".to_string()],
+        data: neoethos_data::FeatureData::InMemory(data),
+    };
+    let close = vec![1.0; n];
+    let mut low = vec![0.9999; n];
+    low[2] = 0.9900;
+    let ohlcv = Ohlcv {
+        timestamp: Some(timestamps),
+        open: close.clone(),
+        high: vec![1.0001; n],
+        low,
+        close,
+        volume: None,
+    };
+    let gene = Gene {
+        indices: vec![0],
+        weights: vec![1.0],
+        long_threshold: 0.5,
+        short_threshold: -0.5,
+        sl_pips: 20.0,
+        tp_pips: 10_000.0,
+        ..Gene::default()
+    };
+    (features, ohlcv, gene)
+}
+
+#[test]
+fn cached_and_non_cached_ga_use_explicit_initial_equity() {
+    use crate::genetic::search_engine::{EvalDataCache, evaluate_genes_cached};
+
+    let (features, ohlcv, gene) = ga_equity_fixture();
+    let genes = [gene];
+    let mut config = EvaluationConfig::default();
+    config.initial_equity_override = Some(25_000.0);
+    config.max_hold_bars = 0;
+    config.trailing_enabled = false;
+    config.pip_value = 0.0001;
+    config.pip_value_per_lot = 10.0;
+    config.spread_pips = 0.0;
+    config.commission_per_trade = 0.0;
+    config.smc_gate_threshold = 0.0;
+
+    let non_cached = crate::genetic::evaluate_genes(&features, &ohlcv, &genes, &config)
+        .expect("non-cached GA evaluation");
+    let cache = EvalDataCache::build(&features, &ohlcv);
+    let cached = evaluate_genes_cached(&features, &ohlcv, &genes, &config, &cache)
+        .expect("cached GA evaluation");
+    assert!(non_cached[0][0] < 0.0);
+    assert!((cached[0][0] - non_cached[0][0]).abs() < 1e-9);
+
+    config.initial_equity_override = Some(100_000.0);
+    let at_100k = crate::genetic::evaluate_genes(&features, &ohlcv, &genes, &config)
+        .expect("100k GA evaluation");
+    assert!((at_100k[0][0] - non_cached[0][0] * 4.0).abs() < 1e-6);
+}
+
 fn profitable_gene(strategy_id: &str) -> Gene {
     Gene {
         strategy_id: strategy_id.to_string(),
@@ -558,6 +692,48 @@ fn cpcv_segmented_fold_matches_explicit_segment_aggregation() {
         segmented[0].max_drawdown,
         left.max_drawdown.max(right.max_drawdown)
     );
+}
+
+#[test]
+fn cpcv_segments_reset_to_explicit_discovery_equity() {
+    use crate::genetic::validation_genes_population_segmented;
+
+    let mut fixture = cpcv_segment_fixture();
+    fixture.config.initial_equity_override = Some(25_000.0);
+    fixture.settings.initial_equity_override = Some(25_000.0);
+    fixture.settings.risk_based_sizing = true;
+    fixture.settings.risk_per_trade_min = 0.01;
+    fixture.settings.risk_per_trade_max = 0.01;
+    let genes = [fixture.gene.clone()];
+    let selected = [0, 1, 2, 5, 6, 7];
+
+    let evaluate = |settings: &crate::eval::BacktestSettings| {
+        validation_genes_population_segmented(
+            fixture.indicators.view(),
+            &fixture.smc,
+            &genes,
+            &fixture.config,
+            settings,
+            &selected,
+            &fixture.close,
+            &fixture.close,
+            &fixture.close,
+            &fixture.months,
+            &fixture.days,
+            &fixture.timestamps,
+        )
+        .expect("segmented evaluation")[0]
+    };
+
+    let at_25k = evaluate(&fixture.settings);
+    let settings_100k = crate::eval::BacktestSettings {
+        initial_equity_override: Some(100_000.0),
+        ..fixture.settings.clone()
+    };
+    let at_100k = evaluate(&settings_100k);
+
+    assert_eq!(at_25k.trade_count, 2);
+    assert!((at_100k.net_profit - at_25k.net_profit * 4.0).abs() < 1e-9);
 }
 
 #[test]

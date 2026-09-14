@@ -1704,6 +1704,7 @@ mod tests {
 
     fn flat_settings() -> BacktestSettings {
         BacktestSettings {
+            initial_equity_override: None,
             sl_pips: 1_000_000.0,
             tp_pips: 1_000_000.0,
             max_hold_bars: 1,
@@ -1825,6 +1826,7 @@ mod tests {
         let days = vec![0_i64; n];
         let timestamps: Vec<i64> = (0..n as i64).map(|i| i * 60_000).collect();
         let mut settings = BacktestSettings::default();
+        settings.initial_equity_override = Some(25_000.0);
         settings.sl_pips = 20.0;
         settings.tp_pips = 10_000.0;
         settings.pip_value = 0.0001;
@@ -1885,7 +1887,9 @@ mod tests {
             &settings,
         )[0];
         assert_eq!(summary.splits.len(), 1);
+        assert_eq!(settings.initial_equity(), 25_000.0);
         assert!((summary.splits[0].pnl - canonical).abs() < 1e-9);
+        assert!((canonical + 250.0).abs() < 1e-6);
         assert!((canonical - fixed).abs() > 1.0);
 
         let err = embargoed_walkforward_backtest(input!(&confidences[..n - 1]))

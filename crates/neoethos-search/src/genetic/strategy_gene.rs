@@ -838,6 +838,7 @@ pub struct SearchResult {
 
 #[derive(Debug, Clone)]
 pub struct EvaluationConfig {
+    pub initial_equity_override: Option<f64>,
     pub symbol: String,
     pub account_currency: String,
     pub max_hold_bars: usize,
@@ -884,6 +885,7 @@ impl Default for EvaluationConfig {
         let smc = current_strategy_evaluation_runtime_overrides().smc_weights;
 
         Self {
+            initial_equity_override: None,
             symbol: String::new(),
             account_currency: String::new(),
             max_hold_bars: 0,
