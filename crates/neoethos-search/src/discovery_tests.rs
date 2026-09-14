@@ -1263,6 +1263,51 @@ fn post_ga_sizing_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<i64>, Vec<i8>,
 }
 
 #[test]
+fn discovery_quality_horizon_converts_feature_nanoseconds_to_milliseconds() {
+    let start_ms = 1_700_000_000_000_i64;
+    let average_month_ms: f64 = 86_400_000.0 * (365.2425 / 12.0);
+    let end_ms = start_ms + (91.8 * average_month_ms).round() as i64;
+    let features = FeatureFrame {
+        timestamps: vec![start_ms * 1_000_000, end_ms * 1_000_000],
+        names: Vec::new(),
+        data: neoethos_data::FeatureData::InMemory(ndarray::Array2::zeros((2, 0))),
+    };
+    let (converted_start_ms, converted_end_ms) = quality_evaluation_horizon_ms(&features);
+    assert_eq!(converted_start_ms, 1_700_000_000_000);
+    assert_eq!(converted_end_ms, end_ms);
+    assert_ne!(converted_start_ms, features.timestamps[0]);
+
+    let trades = (0..7)
+        .map(|i| Trade {
+            entry_time: start_ms + i * 365 * 86_400_000,
+            exit_time: Some(start_ms + i * 365 * 86_400_000 + 3_600_000),
+            pnl: if i % 2 == 0 { 500.0 } else { -250.0 },
+            pnl_pct: Some(if i % 2 == 0 { 0.005 } else { -0.0025 }),
+            duration_hours: Some(1.0),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    let analyzer = StrategyQualityAnalyzer::default();
+    let from_feature_boundary = analyzer.analyze_strategy_with_horizon(
+        "feature-ns",
+        &trades,
+        100_000.0,
+        converted_start_ms,
+        converted_end_ms,
+    );
+    let from_ms =
+        analyzer.analyze_strategy_with_horizon("direct-ms", &trades, 100_000.0, start_ms, end_ms);
+
+    assert!((from_feature_boundary.trades_per_month - 7.0 / 91.8).abs() < 1e-9);
+    assert_eq!(
+        from_feature_boundary.trades_per_month,
+        from_ms.trades_per_month
+    );
+    assert!(from_feature_boundary.trades_per_month > 0.07);
+    assert!(from_feature_boundary.period_days < 3_000.0);
+}
+
+#[test]
 fn post_ga_quality_metrics_and_regime_use_canonical_sizing() {
     let (close, high, low, timestamps, signals, confidences, settings) = post_ga_sizing_fixture();
     let baseline = simulate_post_ga_trades(

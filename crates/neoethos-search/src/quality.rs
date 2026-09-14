@@ -8,9 +8,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 /// Typed replacement for the legacy `NEOETHOS_BOT_PROP_MIN_TRADES_PER_MONTH`
-/// and `NEOETHOS_BOT_TRADING_DAYS_PER_MONTH` env vars. Previously read inline
-/// inside monthly metric aggregation, both knobs change canonical strategy
-/// quality scoring, so they belong in typed runtime config.
+/// and `NEOETHOS_BOT_TRADING_DAYS_PER_MONTH` env vars. The trading-days value
+/// remains accepted for config compatibility, but trade frequency now uses the
+/// real evaluation horizon rather than active-day extrapolation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QualityRuntimeOverrides {
     /// Minimum number of trades a calendar month must contain to count
@@ -66,14 +66,6 @@ impl QualityRuntimeOverrides {
         Self {
             min_trades_per_month: c.min_trades_per_month,
             trading_days_per_month: trading_days,
-        }
-    }
-
-    fn resolved_trading_days_per_month(&self) -> f64 {
-        if self.trading_days_per_month.is_finite() && self.trading_days_per_month >= 1.0 {
-            self.trading_days_per_month
-        } else {
-            21.0
         }
     }
 }
@@ -244,6 +236,17 @@ impl StrategyQualityAnalyzer {
         trades: &[Trade],
         initial_balance: f64,
     ) -> StrategyMetrics {
+        self.analyze_strategy_with_horizon(strategy_id, trades, initial_balance, 0, 0)
+    }
+
+    pub fn analyze_strategy_with_horizon(
+        &self,
+        strategy_id: &str,
+        trades: &[Trade],
+        initial_balance: f64,
+        evaluation_start_ms: i64,
+        evaluation_end_ms: i64,
+    ) -> StrategyMetrics {
         if trades.is_empty() {
             return empty_metrics(strategy_id);
         }
@@ -335,8 +338,9 @@ impl StrategyQualityAnalyzer {
             0.0
         };
 
-        let trades_per_month_raw = calculate_trade_frequency(trades);
-        let trades_per_year = (trades_per_month_raw * 12.0).max(1.0);
+        let trades_per_month_raw =
+            calculate_trade_frequency(trades.len(), evaluation_start_ms, evaluation_end_ms);
+        let trades_per_year = trades_per_month_raw * 12.0;
         let sharpe = calculate_sharpe(&returns, trades_per_year);
         let sortino = calculate_sortino(&returns, trades_per_year);
 
@@ -447,17 +451,27 @@ impl StrategyQualityAnalyzer {
         } else {
             0.0
         };
-        let period_start_ms = trades
-            .iter()
-            .map(|t| t.entry_time)
-            .filter(|&t| t > 0)
-            .min()
-            .unwrap_or(0);
-        let period_end_ms = trades
-            .iter()
-            .filter_map(|t| t.exit_time)
-            .max()
-            .unwrap_or(period_start_ms);
+        let valid_evaluation_horizon =
+            evaluation_start_ms > 0 && evaluation_end_ms > evaluation_start_ms;
+        let period_start_ms = if valid_evaluation_horizon {
+            evaluation_start_ms
+        } else {
+            trades
+                .iter()
+                .map(|t| t.entry_time)
+                .filter(|&t| t > 0)
+                .min()
+                .unwrap_or(0)
+        };
+        let period_end_ms = if valid_evaluation_horizon {
+            evaluation_end_ms
+        } else {
+            trades
+                .iter()
+                .filter_map(|t| t.exit_time)
+                .max()
+                .unwrap_or(period_start_ms)
+        };
         let period_days = if period_end_ms > period_start_ms {
             (period_end_ms - period_start_ms) as f64 / 86_400_000.0
         } else {
@@ -628,38 +642,33 @@ fn analyze_monthly_consistency(
     }
 }
 
-fn calculate_trade_frequency(trades: &[Trade]) -> f64 {
-    if trades.is_empty() {
+const MILLIS_PER_AVERAGE_MONTH: f64 = 86_400_000.0 * (365.2425 / 12.0);
+
+fn calculate_trade_frequency(
+    total_trades: usize,
+    evaluation_start_ms: i64,
+    evaluation_end_ms: i64,
+) -> f64 {
+    if total_trades == 0 || evaluation_start_ms <= 0 {
         return 0.0;
     }
-
-    let mut days = std::collections::HashSet::new();
-    for trade in trades {
-        if trade.entry_time <= 0 {
-            continue;
-        }
-        if let Some(dt) = Utc.timestamp_millis_opt(trade.entry_time).single()
-            && dt.weekday().num_days_from_monday() < 5
-        {
-            let day_key = (dt.year() as i64) * 10000 + (dt.month() as i64) * 100 + dt.day() as i64;
-            days.insert(day_key);
-        }
-    }
-
-    if days.is_empty() {
+    let Some(duration_ms) = evaluation_end_ms.checked_sub(evaluation_start_ms) else {
+        return 0.0;
+    };
+    if duration_ms <= 0 {
         return 0.0;
     }
-
-    let trading_days = days.len() as f64;
-    let days_per_month = current_quality_runtime_overrides().resolved_trading_days_per_month();
-    let months = (trading_days / days_per_month).max(1e-6);
-    trades.len() as f64 / months
+    let months = duration_ms as f64 / MILLIS_PER_AVERAGE_MONTH;
+    if !months.is_finite() || months <= 0.0 {
+        return 0.0;
+    }
+    total_trades as f64 / months
 }
 
 // QA-1: Annualize using actual trade frequency, not daily assumption.
 // √trades_per_year is the correct annualization factor for per-trade returns.
 fn calculate_sharpe(returns: &[f64], trades_per_year: f64) -> f64 {
-    if returns.len() < 2 {
+    if returns.len() < 2 || !trades_per_year.is_finite() || trades_per_year <= 0.0 {
         return 0.0;
     }
     let mean_ret = mean(returns);
@@ -667,12 +676,12 @@ fn calculate_sharpe(returns: &[f64], trades_per_year: f64) -> f64 {
     if std_ret < 1e-9 {
         return 0.0;
     }
-    let annualization = trades_per_year.max(1.0).sqrt();
+    let annualization = trades_per_year.sqrt();
     (mean_ret / std_ret) * annualization
 }
 
 fn calculate_sortino(returns: &[f64], trades_per_year: f64) -> f64 {
-    if returns.len() < 2 {
+    if returns.len() < 2 || !trades_per_year.is_finite() || trades_per_year <= 0.0 {
         return 0.0;
     }
     let mean_ret = mean(returns);
@@ -684,7 +693,7 @@ fn calculate_sortino(returns: &[f64], trades_per_year: f64) -> f64 {
     if std_down < 1e-9 {
         return 0.0;
     }
-    let annualization = trades_per_year.max(1.0).sqrt();
+    let annualization = trades_per_year.sqrt();
     (mean_ret / std_down) * annualization
 }
 
@@ -944,6 +953,89 @@ impl StrategyRanker {
 mod overrides_tests {
     use super::*;
 
+    fn horizon_end(start_ms: i64, months: f64) -> i64 {
+        start_ms + (months * MILLIS_PER_AVERAGE_MONTH).round() as i64
+    }
+
+    fn quality_trade(entry_time: i64, pnl: f64) -> Trade {
+        Trade {
+            entry_time,
+            exit_time: Some(entry_time + 3_600_000),
+            pnl,
+            pnl_pct: Some(pnl / 100_000.0),
+            duration_hours: Some(1.0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn trade_frequency_uses_full_evaluation_horizon() {
+        let start = 1_700_000_000_000_i64;
+        let seven_over_91_8 = calculate_trade_frequency(7, start, horizon_end(start, 91.8));
+        let forty_four_over_136_4 = calculate_trade_frequency(44, start, horizon_end(start, 136.4));
+
+        assert!((seven_over_91_8 - 7.0 / 91.8).abs() < 1e-9);
+        assert!((forty_four_over_136_4 - 44.0 / 136.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sparse_trades_across_years_do_not_get_inflated_sharpe() {
+        let analyzer = StrategyQualityAnalyzer::default();
+        let start = 1_700_000_000_000_i64;
+        let pnls = [600.0, -350.0, 500.0, -250.0, 450.0, -200.0, 400.0];
+        let sparse = pnls
+            .iter()
+            .enumerate()
+            .map(|(i, pnl)| quality_trade(start + i as i64 * 365 * 86_400_000, *pnl))
+            .collect::<Vec<_>>();
+        let dense = pnls
+            .iter()
+            .enumerate()
+            .map(|(i, pnl)| quality_trade(start + i as i64 * 86_400_000, *pnl))
+            .collect::<Vec<_>>();
+
+        let sparse_metrics = analyzer.analyze_strategy_with_horizon(
+            "sparse",
+            &sparse,
+            100_000.0,
+            start,
+            horizon_end(start, 91.8),
+        );
+        let dense_metrics = analyzer.analyze_strategy_with_horizon(
+            "dense",
+            &dense,
+            100_000.0,
+            start,
+            horizon_end(start, 1.0),
+        );
+
+        assert!((sparse_metrics.trades_per_month - 7.0 / 91.8).abs() < 1e-9);
+        assert!((dense_metrics.trades_per_month - 7.0).abs() < 1e-9);
+        assert!(sparse_metrics.sharpe_ratio < dense_metrics.sharpe_ratio / 5.0);
+    }
+
+    #[test]
+    fn invalid_or_zero_horizon_does_not_annualize_returns() {
+        let analyzer = StrategyQualityAnalyzer::default();
+        let start = 1_700_000_000_000_i64;
+        let trades = vec![
+            quality_trade(start, 600.0),
+            quality_trade(start + 86_400_000, -350.0),
+            quality_trade(start + 2 * 86_400_000, -200.0),
+        ];
+        let metrics = analyzer.analyze_strategy_with_horizon(
+            "invalid-horizon",
+            &trades,
+            100_000.0,
+            start,
+            start,
+        );
+
+        assert_eq!(metrics.trades_per_month, 0.0);
+        assert_eq!(metrics.sharpe_ratio, 0.0);
+        assert_eq!(metrics.sortino_ratio, 0.0);
+    }
+
     #[test]
     fn money_view_and_equity_curve_are_correct() {
         // Deterministic check of the pro money-view (2026-06-06): a Sharpe number
@@ -1002,24 +1094,19 @@ mod overrides_tests {
     }
 
     #[test]
-    fn quality_runtime_overrides_clamp_invalid_trading_days() {
-        let bad = QualityRuntimeOverrides {
-            min_trades_per_month: 0,
-            trading_days_per_month: 0.0,
-        };
-        assert!((bad.resolved_trading_days_per_month() - 21.0).abs() < 1e-9);
+    fn quality_runtime_overrides_from_settings_clamps_invalid_trading_days() {
+        let mut settings = neoethos_core::Settings::default();
+        settings.models.quality_runtime.trading_days_per_month = f64::NAN;
+        assert_eq!(
+            QualityRuntimeOverrides::from_settings(&settings).trading_days_per_month,
+            21.0
+        );
 
-        let nan = QualityRuntimeOverrides {
-            min_trades_per_month: 0,
-            trading_days_per_month: f64::NAN,
-        };
-        assert!((nan.resolved_trading_days_per_month() - 21.0).abs() < 1e-9);
-
-        let valid = QualityRuntimeOverrides {
-            min_trades_per_month: 8,
-            trading_days_per_month: 23.0,
-        };
-        assert!((valid.resolved_trading_days_per_month() - 23.0).abs() < 1e-9);
+        settings.models.quality_runtime.trading_days_per_month = 23.0;
+        assert_eq!(
+            QualityRuntimeOverrides::from_settings(&settings).trading_days_per_month,
+            23.0
+        );
     }
 
     #[test]

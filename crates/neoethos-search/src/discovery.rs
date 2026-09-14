@@ -1292,6 +1292,27 @@ fn quality_analyzer_for_config(config: &DiscoveryConfig) -> StrategyQualityAnaly
     }
 }
 
+fn feature_timestamp_ns_to_ms(timestamp_ns: i64) -> i64 {
+    timestamp_ns / 1_000_000
+}
+
+fn quality_evaluation_horizon_ms(features: &FeatureFrame) -> (i64, i64) {
+    (
+        features
+            .timestamps
+            .first()
+            .copied()
+            .map(feature_timestamp_ns_to_ms)
+            .unwrap_or(0),
+        features
+            .timestamps
+            .last()
+            .copied()
+            .map(feature_timestamp_ns_to_ms)
+            .unwrap_or(0),
+    )
+}
+
 fn discovery_backtest_settings(
     config: &DiscoveryConfig,
     gene: &Gene,
@@ -4285,6 +4306,7 @@ where
         type QualityCandidate = (usize, Gene, (Vec<i8>, Vec<f32>), StrategyMetrics, bool, Vec<Trade>);
         let analyzer = quality_analyzer_for_config(config);
         let initial_balance = config.initial_balance;
+        let (evaluation_start_ms, evaluation_end_ms) = quality_evaluation_horizon_ms(features);
 
         // AREA 2 / Stage A (2026-06-09): deterministic per-combo seed for the
         // Monte-Carlo perturbation RNG. Derived ONLY from combo-stable material
@@ -4330,8 +4352,13 @@ where
                     &conf,
                     &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
                 )?;
-                let metrics =
-                    analyzer.analyze_strategy(&gene.strategy_id, &trades, initial_balance);
+                let metrics = analyzer.analyze_strategy_with_horizon(
+                    &gene.strategy_id,
+                    &trades,
+                    initial_balance,
+                    evaluation_start_ms,
+                    evaluation_end_ms,
+                );
                 let strict_quality = passes_strict_quality(&metrics, &config.filtering);
                 let opportunistic_quality =
                     !strict_quality && passes_opportunistic_quality(&metrics, &config.filtering);
@@ -4766,6 +4793,7 @@ where
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| "strict_gates".to_string());
             let analyzer = quality_analyzer_for_config(config);
+            let (evaluation_start_ms, evaluation_end_ms) = quality_evaluation_horizon_ms(features);
             for ((_, gene), sig) in best_effort_fallback {
                 if portfolio.len() >= FALLBACK_PORTFOLIO_MAX {
                     break;
@@ -4788,10 +4816,12 @@ where
                     &sig,
                     &discovery_backtest_settings(config, &gene, ohlcv.close.last().copied()),
                 );
-                quality_metrics.push(analyzer.analyze_strategy(
+                quality_metrics.push(analyzer.analyze_strategy_with_horizon(
                     &gene.strategy_id,
                     &trades,
                     config.initial_balance,
+                    evaluation_start_ms,
+                    evaluation_end_ms,
                 ));
                 portfolio_signals.push(sig);
                 portfolio.push(gene);
