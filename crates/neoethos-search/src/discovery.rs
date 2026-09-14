@@ -3423,7 +3423,7 @@ where
 }
 
 fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
-    let n = x.len() as f32;
+    let mut finite_pairs = 0usize;
     let mut sum_x = 0.0;
     let mut sum_y = 0.0;
     let mut sum_xy = 0.0;
@@ -3433,6 +3433,10 @@ fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
     for i in 0..x.len() {
         let a = x[i];
         let b = y[i];
+        if !a.is_finite() || !b.is_finite() {
+            continue;
+        }
+        finite_pairs += 1;
         sum_x += a;
         sum_y += b;
         sum_xy += a * b;
@@ -3440,12 +3444,26 @@ fn pearson_correlation(x: &[f32], y: &[f32]) -> f32 {
         sum_y2 += b * b;
     }
 
+    if finite_pairs < 2 {
+        return 0.0;
+    }
+    let n = finite_pairs as f32;
     let num = n * sum_xy - sum_x * sum_y;
-    let den = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
-    if den == 0.0 || !den.is_finite() {
+    let x_var = n * sum_x2 - sum_x * sum_x;
+    let y_var = n * sum_y2 - sum_y * sum_y;
+    if x_var <= 0.0 || y_var <= 0.0 || !x_var.is_finite() || !y_var.is_finite() {
+        return 0.0;
+    }
+    let den = (x_var * y_var).sqrt();
+    if den <= 0.0 || !den.is_finite() {
         0.0
     } else {
-        num / den
+        let correlation = num / den;
+        if correlation.is_finite() {
+            correlation
+        } else {
+            0.0
+        }
     }
 }
 

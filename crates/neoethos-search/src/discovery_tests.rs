@@ -1969,6 +1969,95 @@ fn timeframe_group_classifies_multitimeframe_prefixes() {
 }
 
 #[test]
+fn pearson_finite_inputs_preserve_expected_result() {
+    let correlation = pearson_correlation(&[1.0, 2.0, 3.0, 4.0], &[1.0, 3.0, 2.0, 5.0]);
+    assert!((correlation - 0.831_521_87).abs() < 1e-6);
+}
+
+#[test]
+fn pearson_leading_nans_match_finite_suffix() {
+    let with_leading_nans = pearson_correlation(
+        &[f32::NAN, f32::NAN, 1.0, 2.0, 3.0, 4.0, 5.0],
+        &[f32::NAN, f32::NAN, 2.0, 4.0, 6.0, 8.0, 10.0],
+    );
+    let finite_suffix = pearson_correlation(
+        &[1.0, 2.0, 3.0, 4.0, 5.0],
+        &[2.0, 4.0, 6.0, 8.0, 10.0],
+    );
+    assert!((with_leading_nans - 1.0).abs() < 1e-6);
+    assert_eq!(with_leading_nans, finite_suffix);
+}
+
+#[test]
+fn pearson_uses_only_pairwise_finite_indices() {
+    let interspersed = pearson_correlation(
+        &[1.0, f32::NAN, 3.0, 4.0, 5.0],
+        &[2.0, 4.0, f32::NAN, 8.0, 10.0],
+    );
+    let nan_in_x_only = pearson_correlation(
+        &[f32::NAN, 1.0, 2.0, 3.0],
+        &[99.0, 6.0, 4.0, 2.0],
+    );
+    let infinities = pearson_correlation(
+        &[1.0, f32::INFINITY, 2.0, f32::NEG_INFINITY, 3.0],
+        &[2.0, 999.0, 4.0, 999.0, 6.0],
+    );
+
+    assert!((interspersed - 1.0).abs() < 1e-6);
+    assert!((nan_in_x_only + 1.0).abs() < 1e-6);
+    assert!((infinities - 1.0).abs() < 1e-6);
+}
+
+#[test]
+fn pearson_returns_zero_for_too_few_pairs_or_zero_variance() {
+    assert_eq!(pearson_correlation(&[f32::NAN, 1.0], &[2.0, 3.0]), 0.0);
+    assert_eq!(pearson_correlation(&[1.0, 1.0, f32::NAN], &[2.0, 3.0, 4.0]), 0.0);
+}
+
+#[test]
+fn pearson_result_is_always_finite() {
+    let correlation = pearson_correlation(
+        &[f32::MAX, f32::MAX / 2.0, f32::NAN, f32::INFINITY],
+        &[f32::MAX / 2.0, f32::MAX, 1.0, f32::NEG_INFINITY],
+    );
+    assert!(correlation.is_finite());
+}
+
+#[test]
+fn prefilter_ranks_correlated_htf_feature_despite_leading_nans() {
+    let n = 12usize;
+    let mut close = vec![100.0f64; n];
+    for i in 1..n {
+        let change = if (i - 1) % 2 == 0 { 0.01 } else { -0.01 };
+        close[i] = close[i - 1] * (1.0 + change);
+    }
+    let ohlcv = Ohlcv {
+        timestamp: Some((0..n as i64).collect()),
+        open: close.clone(),
+        high: close.clone(),
+        low: close.clone(),
+        close: close.clone(),
+        volume: None,
+    };
+    let mut h4_signal = vec![f32::NAN; n];
+    for i in 2..n - 1 {
+        h4_signal[i] = ((close[i + 1] - close[i]) / close[i]) as f32;
+    }
+    let data = ndarray::Array2::from_shape_fn((n, 2), |(row, column)| match column {
+        0 => 1.0,
+        _ => h4_signal[row],
+    });
+    let frame = FeatureFrame {
+        timestamps: (0..n as i64).collect(),
+        names: vec!["base_constant".to_string(), "H4_signal".to_string()],
+        data: neoethos_data::FeatureData::InMemory(data),
+    };
+
+    let filtered = prefilter_features(&frame, &ohlcv, 1, 1.0, 0);
+    assert_eq!(filtered.names, vec!["H4_signal"]);
+}
+
+#[test]
 fn prefilter_per_timeframe_quota_rescues_multitimeframe_features() {
     // The correlation prefilter ranks by |corr| with the BASE TF's 1-bar
     // forward return. Higher-TF columns are near-constant across base bars →
