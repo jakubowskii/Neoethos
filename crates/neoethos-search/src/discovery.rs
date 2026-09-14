@@ -1,12 +1,15 @@
 use crate::artifact_io::{stable_json_hash, write_json_atomic};
-use crate::eval::{BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core, simulate_trades_core_with_confidence};
+use crate::eval::{
+    BacktestMetrics, fast_evaluate_strategy_core, simulate_trades_core_with_confidence,
+};
+#[cfg(test)]
+use crate::eval::simulate_trades_core;
 use crate::genetic::strategy_gene::{
     EvaluationConfig, MarketCostProfile, resolve_strict_discovery_cost_profile,
 };
 use crate::genetic::{
     Gene, build_smc_arrays, evolve_search_with_progress_and_limits, month_day_indices,
-    signals_and_confidence_for_gene_full, signals_for_gene_full,
-    validation_genes_population_segmented,
+    signals_and_confidence_for_gene_full, validation_genes_population_segmented,
 };
 use crate::quality::{StrategyMetrics, StrategyQualityAnalyzer, Trade};
 use crate::validation::{
@@ -1677,6 +1680,59 @@ fn discovery_dataset_hash(features: &FeatureFrame, ohlcv: &Ohlcv) -> Result<Stri
     })
 }
 
+fn held_out_dataset_hash(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    held_out_start: usize,
+    end: usize,
+) -> Result<String> {
+    stable_json_hash(&DiscoveryDatasetFingerprint {
+        row_count: end - held_out_start,
+        first_timestamp: features.timestamps.get(held_out_start).copied(),
+        last_timestamp: features.timestamps.get(end - 1).copied(),
+        feature_names: &features.names,
+        close_rows: end - held_out_start,
+        first_close: ohlcv.close.get(held_out_start).copied(),
+        last_close: ohlcv.close.get(end - 1).copied(),
+    })
+}
+
+fn project_validation_features<'a>(
+    source: &'a FeatureFrame,
+    effective_feature_names: &[String],
+    validation_kind: &str,
+) -> Result<std::borrow::Cow<'a, FeatureFrame>> {
+    if source.names == effective_feature_names {
+        return Ok(std::borrow::Cow::Borrowed(source));
+    }
+    let mut keep_indices = Vec::with_capacity(effective_feature_names.len());
+    for name in effective_feature_names {
+        let idx = source
+            .names
+            .iter()
+            .position(|candidate| candidate == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{validation_kind} source is missing feature '{name}' from the discovery \
+                     effective feature set; it must come from the same full causal feature \
+                     pipeline as the discovery run"
+                )
+            })?;
+        keep_indices.push(idx);
+    }
+    let mut projected = ndarray::Array2::<f32>::zeros((source.n_samples(), keep_indices.len()));
+    for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
+        projected
+            .column_mut(new_idx)
+            .assign(&source.feature_column(orig_idx));
+    }
+    Ok(std::borrow::Cow::Owned(FeatureFrame {
+        timestamps: source.timestamps.clone(),
+        names: effective_feature_names.to_vec(),
+        data: neoethos_data::FeatureData::InMemory(projected),
+    }))
+}
+
 fn discovery_backtest_policy_hash(
     config: &DiscoveryConfig,
     gene: &Gene,
@@ -2610,131 +2666,65 @@ fn build_discovery_validation_artifacts(
     ))
 }
 
-/// Replay each portfolio gene on a held-out tail window and produce one
-/// [`ForwardTestValidationArtifactFile`] per strategy. The caller passes
-/// the *raw* tail (with the same `feature_names` ordering it had before
-/// discovery) and `effective_feature_names` produced by discovery; the
-/// helper aligns the tail's columns to the post-prefilter set so the
-/// gene indices match.
+/// Generate canonical signals and confidence on the full causal source, then
+/// replay only `held_out_start..` with fresh evaluator state.
 ///
-/// Returns `Err` when any name in `effective_feature_names` is missing
-/// from the tail's columns — this indicates the tail comes from a
-/// different feature pipeline than the discovery run that produced the
-/// portfolio, and a forward-test on it would be meaningless.
+/// Returns `Err` when any effective feature is missing from the full source,
+/// source rows are unaligned, or the held-out boundary is invalid.
 pub fn compute_discovery_forward_test_artifacts(
     portfolio: &[Gene],
     effective_feature_names: &[String],
-    tail_features: &FeatureFrame,
-    tail_ohlcv: &Ohlcv,
+    full_features: &FeatureFrame,
+    full_ohlcv: &Ohlcv,
+    held_out_start: usize,
     config: &DiscoveryConfig,
 ) -> Result<Vec<ForwardTestValidationArtifactFile>> {
     if portfolio.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Project the tail's columns onto the post-prefilter set used by the
-    // portfolio. When the tail already matches, this is a cheap clone of
-    // the underlying ndarray; when it does not, we slice column-by-column.
-    let tail_features = if tail_features.names == effective_feature_names {
-        std::borrow::Cow::Borrowed(tail_features)
-    } else {
-        let mut keep_indices = Vec::with_capacity(effective_feature_names.len());
-        for name in effective_feature_names {
-            let idx = tail_features
-                .names
-                .iter()
-                .position(|candidate| candidate == name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "forward-test tail is missing feature '{}' from the discovery effective \
-                         feature set; the tail must come from the same feature pipeline as the \
-                         in-sample discovery run",
-                        name
-                    )
-                })?;
-            keep_indices.push(idx);
-        }
-        let n_rows = tail_features.n_samples();
-        let mut projected = ndarray::Array2::<f32>::zeros((n_rows, keep_indices.len()));
-        for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
-            projected
-                .column_mut(new_idx)
-                .assign(&tail_features.feature_column(orig_idx));
-        }
-        std::borrow::Cow::Owned(FeatureFrame {
-            timestamps: tail_features.timestamps.clone(),
-            names: effective_feature_names.to_vec(),
-            data: neoethos_data::FeatureData::InMemory(projected),
-        })
-    };
-    let tail_features = tail_features.as_ref();
-
-    let n = validation_row_count(tail_features, tail_ohlcv)?;
-    if n == 0 {
-        anyhow::bail!("forward-test tail must contain at least one bar");
+    let full_features =
+        project_validation_features(full_features, effective_feature_names, "forward-test")?;
+    let full_features = full_features.as_ref();
+    let n = validation_row_count(full_features, full_ohlcv)?;
+    if held_out_start >= n {
+        anyhow::bail!("forward-test held-out start {held_out_start} is outside {n} source rows");
     }
 
-    let temporal_contract = discovery_temporal_contract(config, &tail_features.names)?;
-    let tail_dataset_hash = discovery_dataset_hash(tail_features, tail_ohlcv)?;
-    let (months, days) = month_day_indices(&tail_features.timestamps);
-    let timestamps = &tail_features.timestamps[..n];
-
-    // **F-315 (2026-05-29) — partial diagnostic, full fix deferred to F-315b**.
-    //
-    // The stage-1 GA in `search_engine.rs:818` anneals the SMC gate
-    // from `gate_start` (default 0.75) down to `gate_end` (default
-    // 0.35) across generations. The forward-test pass below
-    // re-evaluates each survivor with the STATIC
-    // `runtime.smc_weights.gate_threshold` from
-    // `current_strategy_evaluation_runtime_overrides()` (default 0.75
-    // per `runtime_overrides.rs:417`). Candidates that survived the
-    // last generation under e.g. 0.35 may fail forward-test with 0.75
-    // — the asymmetry the F-315 ticket flagged. The proper fix is to
-    // forward the stage-1 final gate value through `SearchResult` and
-    // override the forward-test runtime gate to match; that touches
-    // 7 SearchResult construction sites in search_engine.rs plus the
-    // discovery + forward-test plumbing. **F-315b** tracks the
-    // architectural follow-up. For this ticket, we emit a warn at
-    // the top of `current_strategy_evaluation_runtime_overrides()`
-    // when the operator's static gate exceeds 0.5 (i.e. clearly above
-    // the GA's typical `gate_end` of 0.35) so the asymmetry surfaces
-    // in the discovery log instead of staying invisible.
-    {
-        use crate::genetic::runtime_overrides::current_strategy_evaluation_runtime_overrides;
-        let static_gate = current_strategy_evaluation_runtime_overrides()
-            .smc_weights
-            .gate_threshold;
-        if static_gate > 0.5 {
-            tracing::warn!(
-                target: "neoethos_search::discovery",
-                forward_test_smc_gate = static_gate,
-                "F-315 mismatch: forward-test SMC gate ({static_gate:.2}) is well above the GA stage-1 typical end (0.35). Survivors of the final generation may fail forward-test for a threshold they never passed in stage-1. Lower the runtime override (`smc_weights.gate_threshold`) toward 0.35 to align, or wait for F-315b to plumb the GA's final gate through SearchResult."
-            );
-        }
-    }
+    let temporal_contract = discovery_temporal_contract(config, &full_features.names)?;
+    let tail_dataset_hash = held_out_dataset_hash(full_features, full_ohlcv, held_out_start, n)?;
+    let (months, days) = month_day_indices(&full_features.timestamps);
+    let tail = held_out_start..n;
 
     let mut artifacts = Vec::with_capacity(portfolio.len());
     for gene in portfolio {
-        let settings = discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
+        let settings = discovery_backtest_settings(config, gene, full_ohlcv.close.last().copied());
         let strategy_hash = stable_json_hash(gene)?;
         let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-        let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
-        let signals = signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
-        if signals.len() != n {
+        let evaluation_config = config.evaluation_config(full_ohlcv.close.last().copied());
+        let (signals, confidences) = signals_and_confidence_for_gene_full(
+            full_features,
+            full_ohlcv,
+            gene,
+            &evaluation_config,
+        );
+        if signals.len() != n || confidences.len() != n {
             anyhow::bail!(
-                "forward-test signals length {} does not match validation row count {}",
+                "forward-test signal/confidence lengths {}/{} do not match source row count {}",
                 signals.len(),
+                confidences.len(),
                 n
             );
         }
         let summary = compute_forward_test_summary(ForwardTestInput {
-            close: &tail_ohlcv.close[..n],
-            high: &tail_ohlcv.high[..n],
-            low: &tail_ohlcv.low[..n],
-            signals: &signals[..n],
-            months: &months[..n],
-            days: &days[..n],
-            timestamps,
+            close: &full_ohlcv.close[tail.clone()],
+            high: &full_ohlcv.high[tail.clone()],
+            low: &full_ohlcv.low[tail.clone()],
+            signals: &signals[tail.clone()],
+            confidences: &confidences[tail.clone()],
+            months: &months[tail.clone()],
+            days: &days[tail.clone()],
+            timestamps: &full_features.timestamps[tail.clone()],
             settings: &settings,
         })?;
         artifacts.push(ForwardTestValidationArtifactFile::new(
@@ -2750,25 +2740,21 @@ pub fn compute_discovery_forward_test_artifacts(
     Ok(artifacts)
 }
 
-/// Replay each portfolio gene on a held-out tail window, simulate trades
-/// under the canonical backtest core, and aggregate them through
+/// Generate canonical signals and confidence on the full causal source, replay
+/// only `held_out_start..`, and aggregate the fresh-state trades through
 /// [`compute_prop_firm_risk_summary`] to produce one
 /// [`PropFirmRiskValidationArtifactFile`] per strategy. The signature
-/// mirrors [`compute_discovery_forward_test_artifacts`]: the caller
-/// passes the tail with its original `feature_names` ordering, and the
-/// helper aligns it to `effective_feature_names` before running the
-/// simulation.
+/// mirrors [`compute_discovery_forward_test_artifacts`].
 ///
-/// Returns `Err` when the tail is missing any effective feature, when
-/// the tail is empty, or when the simulator produces a signal vector of
-/// the wrong length — each path indicates the tail comes from a
-/// different feature pipeline than the discovery run that produced the
-/// portfolio.
+/// Returns `Err` when any effective feature is missing from the full source,
+/// source rows are unaligned, the held-out boundary is invalid, or canonical
+/// signal/confidence generation does not align with the source.
 pub fn compute_discovery_prop_firm_artifacts(
     portfolio: &[Gene],
     effective_feature_names: &[String],
-    tail_features: &FeatureFrame,
-    tail_ohlcv: &Ohlcv,
+    full_features: &FeatureFrame,
+    full_ohlcv: &Ohlcv,
+    held_out_start: usize,
     config: &DiscoveryConfig,
     rules: PropFirmRiskRules,
 ) -> Result<Vec<PropFirmRiskValidationArtifactFile>> {
@@ -2776,70 +2762,46 @@ pub fn compute_discovery_prop_firm_artifacts(
         return Ok(Vec::new());
     }
 
-    let tail_features = if tail_features.names == effective_feature_names {
-        std::borrow::Cow::Borrowed(tail_features)
-    } else {
-        let mut keep_indices = Vec::with_capacity(effective_feature_names.len());
-        for name in effective_feature_names {
-            let idx = tail_features
-                .names
-                .iter()
-                .position(|candidate| candidate == name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "prop-firm tail is missing feature '{}' from the discovery effective \
-                         feature set; the tail must come from the same feature pipeline as the \
-                         in-sample discovery run",
-                        name
-                    )
-                })?;
-            keep_indices.push(idx);
-        }
-        let n_rows = tail_features.n_samples();
-        let mut projected = ndarray::Array2::<f32>::zeros((n_rows, keep_indices.len()));
-        for (new_idx, &orig_idx) in keep_indices.iter().enumerate() {
-            projected
-                .column_mut(new_idx)
-                .assign(&tail_features.feature_column(orig_idx));
-        }
-        std::borrow::Cow::Owned(FeatureFrame {
-            timestamps: tail_features.timestamps.clone(),
-            names: effective_feature_names.to_vec(),
-            data: neoethos_data::FeatureData::InMemory(projected),
-        })
-    };
-    let tail_features = tail_features.as_ref();
-
-    let n = validation_row_count(tail_features, tail_ohlcv)?;
-    if n == 0 {
-        anyhow::bail!("prop-firm tail must contain at least one bar");
+    let full_features =
+        project_validation_features(full_features, effective_feature_names, "prop-firm")?;
+    let full_features = full_features.as_ref();
+    let n = validation_row_count(full_features, full_ohlcv)?;
+    if held_out_start >= n {
+        anyhow::bail!("prop-firm held-out start {held_out_start} is outside {n} source rows");
     }
-    let temporal_contract = discovery_temporal_contract(config, &tail_features.names)?;
-    let tail_dataset_hash = discovery_dataset_hash(tail_features, tail_ohlcv)?;
-    let timestamps = &tail_features.timestamps[..n];
+    let temporal_contract = discovery_temporal_contract(config, &full_features.names)?;
+    let tail_dataset_hash = held_out_dataset_hash(full_features, full_ohlcv, held_out_start, n)?;
+    let tail = held_out_start..n;
 
     let mut artifacts = Vec::with_capacity(portfolio.len());
     for gene in portfolio {
-        let settings = discovery_backtest_settings(config, gene, tail_ohlcv.close.last().copied());
+        let settings = discovery_backtest_settings(config, gene, full_ohlcv.close.last().copied());
         let strategy_hash = stable_json_hash(gene)?;
         let evaluation_config_hash = discovery_backtest_policy_hash(config, gene, &settings)?;
-        let evaluation_config = config.evaluation_config(tail_ohlcv.close.last().copied());
-        let signals = signals_for_gene_full(tail_features, tail_ohlcv, gene, &evaluation_config);
-        if signals.len() != n {
+        let evaluation_config = config.evaluation_config(full_ohlcv.close.last().copied());
+        let (signals, confidences) = signals_and_confidence_for_gene_full(
+            full_features,
+            full_ohlcv,
+            gene,
+            &evaluation_config,
+        );
+        if signals.len() != n || confidences.len() != n {
             anyhow::bail!(
-                "prop-firm signals length {} does not match validation row count {}",
+                "prop-firm signal/confidence lengths {}/{} do not match source row count {}",
                 signals.len(),
+                confidences.len(),
                 n
             );
         }
-        let trades = simulate_trades_core(
-            &tail_ohlcv.close[..n],
-            &tail_ohlcv.high[..n],
-            &tail_ohlcv.low[..n],
-            timestamps,
-            &signals[..n],
+        let trades = simulate_trades_core_with_confidence(
+            &full_ohlcv.close[tail.clone()],
+            &full_ohlcv.high[tail.clone()],
+            &full_ohlcv.low[tail.clone()],
+            &full_features.timestamps[tail.clone()],
+            &signals[tail.clone()],
+            &confidences[tail.clone()],
             &settings,
-        );
+        )?;
         let summary = compute_prop_firm_risk_summary(PropFirmRiskInput {
             trades: &trades,
             initial_balance: config.initial_balance,

@@ -2132,9 +2132,15 @@ fn compute_discovery_forward_test_artifacts_returns_empty_for_empty_portfolio() 
     let config = DiscoveryConfig::default();
     let features = sample_feature_frame();
     let ohlcv = sample_ohlcv();
-    let artifacts =
-        compute_discovery_forward_test_artifacts(&[], &features.names, &features, &ohlcv, &config)
-            .expect("empty portfolio should produce zero artifacts");
+    let artifacts = compute_discovery_forward_test_artifacts(
+        &[],
+        &features.names,
+        &features,
+        &ohlcv,
+        0,
+        &config,
+    )
+    .expect("empty portfolio should produce zero artifacts");
     assert!(artifacts.is_empty());
 }
 
@@ -2149,6 +2155,7 @@ fn compute_discovery_forward_test_artifacts_rejects_tails_missing_features() {
         &["signal".to_string()],
         &tail_features,
         &sample_ohlcv(),
+        0,
         &config,
     )
     .expect_err("tail without the effective feature must be rejected");
@@ -2167,6 +2174,7 @@ fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy()
         &features.names,
         &features,
         &ohlcv,
+        0,
         &config,
     )
     .expect("forward-test artifacts should build for in-band tail");
@@ -2181,6 +2189,292 @@ fn compute_discovery_forward_test_artifacts_produces_one_artifact_per_strategy()
     }
 }
 
+fn held_out_parity_fixture(
+    initial_balance: f64,
+) -> (FeatureFrame, Ohlcv, Gene, DiscoveryConfig, usize) {
+    let n = 64;
+    let held_out_start = 24;
+    let timestamps: Vec<i64> = (0..n as i64)
+        .map(|index| 1_704_067_200_000 + index * 43_200_000)
+        .collect();
+    let mut data = ndarray::Array2::<f32>::zeros((n, 1));
+    data[[held_out_start, 0]] = 1.0;
+    let features = FeatureFrame {
+        timestamps: timestamps.clone(),
+        names: vec!["signal".to_string()],
+        data: neoethos_data::FeatureData::InMemory(data),
+    };
+    let close = vec![1.0; n];
+    let mut low = vec![0.9999; n];
+    low[held_out_start + 4] = 0.9900;
+    let ohlcv = Ohlcv {
+        timestamp: Some(timestamps),
+        open: close.clone(),
+        high: vec![1.0001; n],
+        low,
+        close,
+        volume: None,
+    };
+    let gene = Gene {
+        strategy_id: "held-out-parity".to_string(),
+        indices: vec![0],
+        weights: vec![1.0],
+        long_threshold: 0.5,
+        short_threshold: -0.5,
+        sl_pips: 20.0,
+        tp_pips: 10_000.0,
+        ..Gene::default()
+    };
+    let config = DiscoveryConfig {
+        initial_balance,
+        evaluation_symbol: "EURUSD".to_string(),
+        evaluation_account_currency: "USD".to_string(),
+        resolved_market_cost_profile: Some(MarketCostProfile {
+            symbol: "EURUSD".to_string(),
+            account_currency: "USD".to_string(),
+            pip_value: 0.0001,
+            pip_value_per_lot: 10.0,
+            spread_pips: 1.2,
+            commission_per_trade: 7.0,
+            swap_long_pips_per_day: -0.5,
+            swap_short_pips_per_day: 0.25,
+            pnl_conversion_fee_rate: 0.01,
+        }),
+        ..DiscoveryConfig::default()
+    };
+    (features, ohlcv, gene, config, held_out_start)
+}
+
+#[test]
+fn held_out_forward_and_prop_firm_match_canonical_confidence_costs_and_equity() {
+    let mut forward_nets = Vec::new();
+    for initial_balance in [25_000.0, 100_000.0] {
+        let (features, ohlcv, gene, config, start) = held_out_parity_fixture(initial_balance);
+        let eval_config = config.evaluation_config(ohlcv.close.last().copied());
+        let settings = discovery_backtest_settings(&config, &gene, ohlcv.close.last().copied());
+        let (signals, confidences) =
+            signals_and_confidence_for_gene_full(&features, &ohlcv, &gene, &eval_config);
+        assert_eq!(confidences[start], 0.5);
+        assert!(settings.risk_based_sizing);
+        assert_eq!(settings.initial_equity(), initial_balance);
+        assert_eq!(settings.spread_pips, 1.2);
+        assert_eq!(settings.commission_per_trade, 7.0);
+        assert_eq!(settings.swap_long_pips_per_day, -0.5);
+        assert_eq!(settings.pnl_conversion_fee_rate, 0.01);
+
+        let (months, days) = month_day_indices(&features.timestamps);
+        let direct_metrics = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
+            &ohlcv.close[start..],
+            &ohlcv.high[start..],
+            &ohlcv.low[start..],
+            &signals[start..],
+            &confidences[start..],
+            &months[start..],
+            &days[start..],
+            &features.timestamps[start..],
+            &settings,
+        ));
+        let forward = compute_discovery_forward_test_artifacts(
+            std::slice::from_ref(&gene),
+            &features.names,
+            &features,
+            &ohlcv,
+            start,
+            &config,
+        )
+        .expect("canonical forward artifact");
+        assert_eq!(forward[0].summary.metrics, direct_metrics);
+        assert_eq!(direct_metrics.trade_count, 1);
+
+        let fixed_lot = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
+            &ohlcv.close[start..],
+            &ohlcv.high[start..],
+            &ohlcv.low[start..],
+            &signals[start..],
+            &[],
+            &months[start..],
+            &days[start..],
+            &features.timestamps[start..],
+            &settings,
+        ));
+        assert!((direct_metrics.net_profit - fixed_lot.net_profit).abs() > 1.0);
+
+        let rules = PropFirmRiskRules::default();
+        let direct_trades = simulate_trades_core_with_confidence(
+            &ohlcv.close[start..],
+            &ohlcv.high[start..],
+            &ohlcv.low[start..],
+            &features.timestamps[start..],
+            &signals[start..],
+            &confidences[start..],
+            &settings,
+        )
+        .expect("canonical held-out trades");
+        assert_eq!(direct_trades.len(), 1);
+        assert!(direct_trades[0].duration_hours.unwrap_or(0.0) > 24.0);
+        assert!((direct_trades[0].pnl - direct_metrics.net_profit).abs() < 1e-6);
+        let direct_prop_firm = compute_prop_firm_risk_summary(PropFirmRiskInput {
+            trades: &direct_trades,
+            initial_balance,
+            rules,
+        });
+        let prop_firm = compute_discovery_prop_firm_artifacts(
+            &[gene],
+            &features.names,
+            &features,
+            &ohlcv,
+            start,
+            &config,
+            rules,
+        )
+        .expect("canonical prop-firm artifact");
+        assert_eq!(
+            stable_json_hash(&prop_firm[0].summary).unwrap(),
+            stable_json_hash(&direct_prop_firm).unwrap()
+        );
+        assert_eq!(prop_firm[0].summary.trades_observed, 1);
+        forward_nets.push(direct_metrics.net_profit);
+    }
+    assert!((forward_nets[1] - 4.0 * forward_nets[0]).abs() < 1e-6);
+}
+
+fn held_out_displacement_fixture() -> (FeatureFrame, Ohlcv, Gene, DiscoveryConfig, usize) {
+    let n = 50;
+    let held_out_start = 24;
+    let timestamps: Vec<i64> = (0..n as i64)
+        .map(|index| 1_704_067_200_000 + index * 3_600_000)
+        .collect();
+    let mut data = ndarray::Array2::<f32>::zeros((n, 1));
+    data[[held_out_start, 0]] = 1.0;
+    let features = FeatureFrame {
+        timestamps: timestamps.clone(),
+        names: vec!["signal".to_string()],
+        data: neoethos_data::FeatureData::InMemory(data),
+    };
+    let open = vec![1.0; n];
+    let mut close = vec![1.0001; n];
+    close[held_out_start] = 1.01;
+    close[(held_out_start + 1)..].fill(1.0);
+    let mut high = vec![1.0002; n];
+    high[held_out_start] = 1.0101;
+    let mut low = vec![0.9999; n];
+    low[held_out_start + 3] = 0.9900;
+    let ohlcv = Ohlcv {
+        timestamp: Some(timestamps),
+        open,
+        high,
+        low,
+        close,
+        volume: None,
+    };
+    let gene = Gene {
+        strategy_id: "held-out-displacement".to_string(),
+        indices: vec![0],
+        weights: vec![1.0],
+        long_threshold: 0.5,
+        short_threshold: -0.5,
+        use_displacement: true,
+        sl_pips: 20.0,
+        tp_pips: 10_000.0,
+        ..Gene::default()
+    };
+    let config = equity_test_config(25_000.0);
+    (features, ohlcv, gene, config, held_out_start)
+}
+
+#[test]
+fn held_out_artifacts_generate_with_full_warmup_then_slice() {
+    let (features, ohlcv, gene, config, start) = held_out_displacement_fixture();
+    let eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let (full_signals, _) =
+        signals_and_confidence_for_gene_full(&features, &ohlcv, &gene, &eval_config);
+    assert_eq!(full_signals[start], 1);
+
+    let tail_features = FeatureFrame {
+        timestamps: features.timestamps[start..].to_vec(),
+        names: features.names.clone(),
+        data: neoethos_data::FeatureData::InMemory(
+            features.sample_window(start, features.n_samples()),
+        ),
+    };
+    let tail_ohlcv = slice_ohlcv(&ohlcv, start, ohlcv.close.len());
+    let (isolated_signals, _) =
+        signals_and_confidence_for_gene_full(&tail_features, &tail_ohlcv, &gene, &eval_config);
+    assert_eq!(isolated_signals[0], 0);
+
+    let forward = compute_discovery_forward_test_artifacts(
+        std::slice::from_ref(&gene),
+        &features.names,
+        &features,
+        &ohlcv,
+        start,
+        &config,
+    )
+    .expect("warm forward artifact");
+    let prop_firm = compute_discovery_prop_firm_artifacts(
+        &[gene],
+        &features.names,
+        &features,
+        &ohlcv,
+        start,
+        &config,
+        PropFirmRiskRules::default(),
+    )
+    .expect("warm prop-firm artifact");
+    assert_eq!(forward[0].summary.metrics.trade_count, 1);
+    assert_eq!(prop_firm[0].summary.trades_observed, 1);
+}
+
+#[test]
+fn held_out_artifacts_reset_state_and_exclude_pre_boundary_signal() {
+    let (mut features, mut ohlcv, gene, config, start) = held_out_parity_fixture(25_000.0);
+    let mut data = ndarray::Array2::<f32>::zeros((features.n_samples(), 1));
+    data[[start - 1, 0]] = 1.0;
+    features.data = neoethos_data::FeatureData::InMemory(data);
+    ohlcv.low.fill(0.9999);
+    ohlcv.low[start + 2] = 0.9900;
+
+    let eval_config = config.evaluation_config(ohlcv.close.last().copied());
+    let settings = discovery_backtest_settings(&config, &gene, ohlcv.close.last().copied());
+    let (signals, confidences) =
+        signals_and_confidence_for_gene_full(&features, &ohlcv, &gene, &eval_config);
+    let (months, days) = month_day_indices(&features.timestamps);
+    let continuous = BacktestMetrics::from_metric_array(fast_evaluate_strategy_core(
+        &ohlcv.close,
+        &ohlcv.high,
+        &ohlcv.low,
+        &signals,
+        &confidences,
+        &months,
+        &days,
+        &features.timestamps,
+        &settings,
+    ));
+    assert_eq!(continuous.trade_count, 1);
+
+    let forward = compute_discovery_forward_test_artifacts(
+        std::slice::from_ref(&gene),
+        &features.names,
+        &features,
+        &ohlcv,
+        start,
+        &config,
+    )
+    .expect("reset forward artifact");
+    let prop_firm = compute_discovery_prop_firm_artifacts(
+        &[gene],
+        &features.names,
+        &features,
+        &ohlcv,
+        start,
+        &config,
+        PropFirmRiskRules::default(),
+    )
+    .expect("reset prop-firm artifact");
+    assert_eq!(forward[0].summary.metrics.trade_count, 0);
+    assert_eq!(prop_firm[0].summary.trades_observed, 0);
+}
+
 #[test]
 fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
     let dir = temp_dir("forward-test-validations");
@@ -2193,6 +2487,7 @@ fn save_forward_test_validation_artifacts_writes_one_file_per_strategy() {
         &features.names,
         &features,
         &ohlcv,
+        0,
         &config,
     )
     .expect("forward-test artifacts should build");
@@ -2414,6 +2709,7 @@ fn compute_discovery_prop_firm_artifacts_returns_empty_for_empty_portfolio() {
         &features.names,
         &features,
         &ohlcv,
+        0,
         &config,
         PropFirmRiskRules::default(),
     )
@@ -2432,6 +2728,7 @@ fn compute_discovery_prop_firm_artifacts_rejects_tails_missing_features() {
         &["signal".to_string()],
         &tail_features,
         &sample_ohlcv(),
+        0,
         &config,
         PropFirmRiskRules::default(),
     )
@@ -2451,6 +2748,7 @@ fn compute_discovery_prop_firm_artifacts_produces_one_artifact_per_strategy() {
         &features.names,
         &features,
         &ohlcv,
+        0,
         &config,
         PropFirmRiskRules::default(),
     )

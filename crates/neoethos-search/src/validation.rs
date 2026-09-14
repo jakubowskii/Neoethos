@@ -398,6 +398,7 @@ pub struct ForwardTestInput<'a> {
     pub high: &'a [f64],
     pub low: &'a [f64],
     pub signals: &'a [i8],
+    pub confidences: &'a [f32],
     pub months: &'a [i64],
     pub days: &'a [i64],
     pub timestamps: &'a [i64],
@@ -417,6 +418,7 @@ pub fn compute_forward_test_summary(input: ForwardTestInput<'_>) -> Result<Forwa
     if input.high.len() != bars
         || input.low.len() != bars
         || input.signals.len() != bars
+        || input.confidences.len() != bars
         || input.months.len() != bars
         || input.days.len() != bars
     {
@@ -431,9 +433,7 @@ pub fn compute_forward_test_summary(input: ForwardTestInput<'_>) -> Result<Forwa
         input.high,
         input.low,
         input.signals,
-        // Phase 1: legacy fixed-1-lot for the forward-test summary (no
-        // confidence threaded here yet) — `&[]` forces pos_lots = 1.0.
-        &[],
+        input.confidences,
         input.months,
         input.days,
         input.timestamps,
@@ -2064,6 +2064,7 @@ mod tests {
         let high = close;
         let low = close;
         let signals = [1_i8, 0, 1, 0, 0];
+        let confidences = [1.0_f32; 5];
         let months = [1_i64; 5];
         let days = [1_i64, 1, 1, 2, 2];
         let timestamps = [
@@ -2078,6 +2079,7 @@ mod tests {
             high: &high,
             low: &low,
             signals: &signals,
+            confidences: &confidences,
             months: &months,
             days: &days,
             timestamps: &timestamps,
@@ -2094,6 +2096,7 @@ mod tests {
         let close = [1.0, 1.0, 1.0];
         let bad_high = [1.0, 1.0]; // length mismatch
         let signals = [0_i8; 3];
+        let confidences = [0.0_f32; 3];
         let months = [1_i64; 3];
         let days = [1_i64; 3];
         let err = compute_forward_test_summary(ForwardTestInput {
@@ -2101,6 +2104,7 @@ mod tests {
             high: &bad_high,
             low: &close,
             signals: &signals,
+            confidences: &confidences,
             months: &months,
             days: &days,
             timestamps: &[],
@@ -2114,6 +2118,7 @@ mod tests {
             high: &[],
             low: &[],
             signals: &[],
+            confidences: &[],
             months: &[],
             days: &[],
             timestamps: &[],

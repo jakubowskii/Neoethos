@@ -1044,76 +1044,57 @@ pub fn start_discovery_job(
                 &format!("{} {}", search_request.symbol, search_request.base_tf),
             )?;
 
-            // Forward-test the portfolio on the strictly held-out 20% tail
-            // (`wfv_bound..`). This is the OOS slice the discovery cycle
-            // never saw, so the resulting forward-test summary is an
-            // unbiased estimate of out-of-sample behavior.
-            if !result.portfolio.is_empty() && wfv_bound < base_ohlcv.close.len() {
-                let tail_ohlcv = neoethos_data::Ohlcv {
-                    timestamp: base_ohlcv
-                        .timestamp
-                        .as_ref()
-                        .map(|ts| ts[wfv_bound..].to_vec()),
-                    open: base_ohlcv.open[wfv_bound..].to_vec(),
-                    high: base_ohlcv.high[wfv_bound..].to_vec(),
-                    low: base_ohlcv.low[wfv_bound..].to_vec(),
-                    close: base_ohlcv.close[wfv_bound..].to_vec(),
-                    volume: base_ohlcv.volume.as_ref().map(|v| v[wfv_bound..].to_vec()),
-                };
-                let tail_feat_start = wfv_bound.min(features.n_samples());
-                let tail_feat_rows = features.n_samples().saturating_sub(tail_feat_start);
-                if tail_feat_rows > 0 && !tail_ohlcv.close.is_empty() {
-                    let tail_features = neoethos_data::FeatureFrame {
-                        timestamps: features.timestamps[tail_feat_start..].to_vec(),
-                        names: features.names.clone(),
-                        data: neoethos_data::FeatureData::InMemory(
-                            features.sample_window(tail_feat_start, features.n_samples()),
-                        ),
-                    };
-                    match compute_discovery_forward_test_artifacts(
-                        &result.portfolio,
-                        &result.effective_feature_names,
-                        &tail_features,
-                        &tail_ohlcv,
-                        &resolved_config,
-                    ) {
-                        Ok(artifacts) => {
-                            result.forward_test_validation_artifacts = artifacts;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "neoethos_app::discovery",
-                                error = %err,
-                                "forward-test artifact computation failed; portfolio export \
-                                 will proceed without forward-test evidence"
-                            );
-                        }
+            // Build canonical signals/confidence on the full causal source,
+            // then reset evaluator state and replay only `wfv_bound..`.
+            if !result.portfolio.is_empty()
+                && wfv_bound < base_ohlcv.close.len()
+                && wfv_bound < features.n_samples()
+            {
+                match compute_discovery_forward_test_artifacts(
+                    &result.portfolio,
+                    &result.effective_feature_names,
+                    &features,
+                    &base_ohlcv,
+                    wfv_bound,
+                    &resolved_config,
+                ) {
+                    Ok(artifacts) => {
+                        result.forward_test_validation_artifacts = artifacts;
                     }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "neoethos_app::discovery",
+                            error = %err,
+                            "forward-test artifact computation failed; portfolio export \
+                             will proceed without forward-test evidence"
+                        );
+                    }
+                }
 
-                    // Reuse the same OOS tail to compute prop-firm
-                    // validation evidence. The rule set is sourced from
-                    // the typed `DiscoveryRequest::prop_firm_rules`
-                    // field so non-FTMO challenges drive the gate
-                    // without code changes.
-                    match compute_discovery_prop_firm_artifacts(
-                        &result.portfolio,
-                        &result.effective_feature_names,
-                        &tail_features,
-                        &tail_ohlcv,
-                        &resolved_config,
-                        search_request.prop_firm_rules,
-                    ) {
-                        Ok(artifacts) => {
-                            result.prop_firm_validation_artifacts = artifacts;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                target: "neoethos_app::discovery",
-                                error = %err,
-                                "prop-firm artifact computation failed; portfolio export \
-                                 will proceed without prop-firm evidence"
-                            );
-                        }
+                // Reuse the same OOS tail to compute prop-firm
+                // validation evidence. The rule set is sourced from
+                // the typed `DiscoveryRequest::prop_firm_rules`
+                // field so non-FTMO challenges drive the gate
+                // without code changes.
+                match compute_discovery_prop_firm_artifacts(
+                    &result.portfolio,
+                    &result.effective_feature_names,
+                    &features,
+                    &base_ohlcv,
+                    wfv_bound,
+                    &resolved_config,
+                    search_request.prop_firm_rules,
+                ) {
+                    Ok(artifacts) => {
+                        result.prop_firm_validation_artifacts = artifacts;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "neoethos_app::discovery",
+                            error = %err,
+                            "prop-firm artifact computation failed; portfolio export \
+                             will proceed without prop-firm evidence"
+                        );
                     }
                 }
             }
