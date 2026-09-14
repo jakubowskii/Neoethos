@@ -2947,6 +2947,98 @@ pub fn run_discovery_cycle(
     run_discovery_cycle_with_progress(features, ohlcv, config, |_| {})
 }
 
+fn validate_discovery_ohlc_integrity(
+    features: &FeatureFrame,
+    ohlcv: &Ohlcv,
+    config: &DiscoveryConfig,
+) -> Result<()> {
+    let n = ohlcv.close.len();
+    let feature_rows = features.n_samples();
+    if n == 0
+        || ohlcv.open.len() != n
+        || ohlcv.high.len() != n
+        || ohlcv.low.len() != n
+        || feature_rows != n
+        || features.timestamps.len() != n
+        || ohlcv.timestamp.as_ref().is_some_and(|values| values.len() != n)
+        || ohlcv.volume.as_ref().is_some_and(|values| values.len() != n)
+    {
+        anyhow::bail!(
+            "Discovery OHLC integrity failed for {} {}: column length mismatch \
+             (features={feature_rows}, timestamps={}, OHLC timestamps={:?}, open={}, high={}, low={}, close={n}, volume={:?})",
+            config.evaluation_symbol,
+            config.timeframe_label,
+            features.timestamps.len(),
+            ohlcv.timestamp.as_ref().map(Vec::len),
+            ohlcv.open.len(),
+            ohlcv.high.len(),
+            ohlcv.low.len(),
+            ohlcv.volume.as_ref().map(Vec::len),
+        );
+    }
+
+    for (index, &value) in features.timestamps.iter().enumerate() {
+        if value <= 0 || (index > 0 && value <= features.timestamps[index - 1]) {
+            anyhow::bail!(
+                "Discovery OHLC integrity failed for {} {} at bar {index}: timestamp={value} \
+                 must be positive and strictly increasing after {:?}",
+                config.evaluation_symbol,
+                config.timeframe_label,
+                index.checked_sub(1).map(|previous| features.timestamps[previous]),
+            );
+        }
+    }
+    if let Some(timestamps) = &ohlcv.timestamp
+        && let Some(index) = timestamps
+            .iter()
+            .zip(&features.timestamps)
+            .position(|(ohlc, feature)| ohlc != feature)
+    {
+        anyhow::bail!(
+            "Discovery OHLC integrity failed for {} {} at bar {index}: \
+             feature timestamp={} does not match OHLC timestamp={}",
+            config.evaluation_symbol,
+            config.timeframe_label,
+            features.timestamps[index],
+            timestamps[index],
+        );
+    }
+
+    for index in 0..n {
+        let open = ohlcv.open[index];
+        let high = ohlcv.high[index];
+        let low = ohlcv.low[index];
+        let close = ohlcv.close[index];
+        for (field, value) in [("open", open), ("high", high), ("low", low), ("close", close)] {
+            if !value.is_finite() || value <= 0.0 {
+                anyhow::bail!(
+                    "Discovery OHLC integrity failed for {} {} at bar {index}: {field}={value} \
+                     must be finite and greater than zero",
+                    config.evaluation_symbol,
+                    config.timeframe_label,
+                );
+            }
+        }
+        if high < open || high < close || high < low || low > open || low > close {
+            anyhow::bail!(
+                "Discovery OHLC integrity failed for {} {} at bar {index}: invalid geometry \
+                 (open={open}, high={high}, low={low}, close={close})",
+                config.evaluation_symbol,
+                config.timeframe_label,
+            );
+        }
+        if let Some(value) = ohlcv.volume.as_ref().map(|values| values[index]).filter(|value| !value.is_finite())
+        {
+            anyhow::bail!(
+                "Discovery OHLC integrity failed for {} {} at bar {index}: volume={value} must be finite",
+                config.evaluation_symbol,
+                config.timeframe_label,
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn run_discovery_cycle_with_progress<F>(
     features: &FeatureFrame,
     ohlcv: &Ohlcv,
@@ -2956,6 +3048,7 @@ pub fn run_discovery_cycle_with_progress<F>(
 where
     F: FnMut(DiscoveryProgress),
 {
+    validate_discovery_ohlc_integrity(features, ohlcv, config)?;
     if !config.initial_balance.is_finite() || config.initial_balance <= 0.0 {
         anyhow::bail!(
             "run_discovery_cycle: DiscoveryConfig.initial_balance must be finite and greater than zero"

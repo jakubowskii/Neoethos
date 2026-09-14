@@ -2331,6 +2331,209 @@ fn valid_discovery_config() -> DiscoveryConfig {
     }
 }
 
+fn set_first_price(ohlcv: &mut Ohlcv, field: &str, value: f64) {
+    match field {
+        "open" => ohlcv.open[0] = value,
+        "high" => ohlcv.high[0] = value,
+        "low" => ohlcv.low[0] = value,
+        "close" => ohlcv.close[0] = value,
+        _ => unreachable!("unknown OHLC field"),
+    }
+}
+
+fn assert_discovery_integrity_failure(
+    features: FeatureFrame,
+    ohlcv: Ohlcv,
+    expected: &str,
+) -> String {
+    let mut progress_seen = false;
+    let err = run_discovery_cycle_with_progress(
+        &features,
+        &ohlcv,
+        &valid_discovery_config(),
+        |_| progress_seen = true,
+    )
+    .expect_err("corrupt OHLC input must fail before GA");
+    let message = err.to_string();
+    assert!(
+        message.contains(expected),
+        "expected {expected:?} in integrity error, got: {message}"
+    );
+    assert!(!progress_seen, "integrity preflight must run before GA progress");
+    message
+}
+
+#[test]
+fn discovery_integrity_rejects_zero_in_every_ohlc_field_before_ga() {
+    for field in ["open", "high", "low", "close"] {
+        let mut ohlcv = sample_ohlcv();
+        set_first_price(&mut ohlcv, field, 0.0);
+        let message = assert_discovery_integrity_failure(sample_feature_frame(), ohlcv, field);
+        assert!(message.contains("bar 0"));
+        assert!(message.contains("=0"));
+    }
+
+    let mut ohlcv = sample_ohlcv();
+    ohlcv.close[0] = -1.0;
+    assert_discovery_integrity_failure(sample_feature_frame(), ohlcv, "close=-1");
+}
+
+#[test]
+fn discovery_integrity_rejects_non_finite_in_every_ohlc_field_before_ga() {
+    for field in ["open", "high", "low", "close"] {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut ohlcv = sample_ohlcv();
+            set_first_price(&mut ohlcv, field, value);
+            let message = assert_discovery_integrity_failure(sample_feature_frame(), ohlcv, field);
+            assert!(message.contains("must be finite and greater than zero"));
+        }
+    }
+}
+
+#[test]
+fn discovery_integrity_rejects_every_impossible_ohlc_geometry() {
+    let cases = [
+        (2.0, 0.5, 1.0, 2.0), // high < low
+        (2.0, 1.5, 1.0, 1.4), // high < open
+        (1.4, 1.5, 1.0, 2.0), // high < close
+        (2.0, 3.0, 2.5, 2.6), // low > open
+        (2.6, 3.0, 2.5, 2.0), // low > close
+    ];
+    for (open, high, low, close) in cases {
+        let mut ohlcv = sample_ohlcv();
+        ohlcv.open[0] = open;
+        ohlcv.high[0] = high;
+        ohlcv.low[0] = low;
+        ohlcv.close[0] = close;
+        assert_discovery_integrity_failure(
+            sample_feature_frame(),
+            ohlcv,
+            "invalid geometry",
+        );
+    }
+}
+
+#[test]
+fn discovery_integrity_rejects_unequal_ohlc_lengths() {
+    for field in ["open", "high", "low", "close"] {
+        let mut ohlcv = sample_ohlcv();
+        match field {
+            "open" => {
+                ohlcv.open.pop();
+            }
+            "high" => {
+                ohlcv.high.pop();
+            }
+            "low" => {
+                ohlcv.low.pop();
+            }
+            "close" => {
+                ohlcv.close.pop();
+            }
+            _ => unreachable!(),
+        }
+        assert_discovery_integrity_failure(
+            sample_feature_frame(),
+            ohlcv,
+            "column length mismatch",
+        );
+    }
+}
+
+#[test]
+fn discovery_integrity_rejects_bad_timestamp_contract() {
+    let mut short_features = sample_feature_frame();
+    short_features.timestamps.pop();
+    assert_discovery_integrity_failure(
+        short_features,
+        sample_ohlcv(),
+        "column length mismatch",
+    );
+
+    let features = sample_feature_frame();
+    let mut short_ohlcv_timestamps = sample_ohlcv();
+    short_ohlcv_timestamps
+        .timestamp
+        .as_mut()
+        .expect("fixture timestamps")
+        .pop();
+    assert_discovery_integrity_failure(
+        features,
+        short_ohlcv_timestamps,
+        "column length mismatch",
+    );
+
+    for invalid in [0, 1] {
+        let mut features = sample_feature_frame();
+        if invalid == 0 {
+            features.timestamps[0] = 0;
+        } else {
+            features.timestamps[1] = features.timestamps[0];
+        }
+        assert_discovery_integrity_failure(features, sample_ohlcv(), "timestamp=");
+    }
+}
+
+#[test]
+fn discovery_integrity_rejects_shifted_ohlc_timestamps() {
+    let features = sample_feature_frame();
+    let mut ohlcv = sample_ohlcv();
+    for timestamp in ohlcv.timestamp.as_mut().expect("fixture timestamps") {
+        *timestamp += 60_000;
+    }
+    let message = assert_discovery_integrity_failure(features, ohlcv, "at bar 0");
+    assert!(message.contains("feature timestamp="));
+    assert!(message.contains("OHLC timestamp="));
+    assert!(message.contains("EURUSD M1"));
+}
+
+#[test]
+fn discovery_integrity_rejects_one_mismatched_ohlc_timestamp() {
+    let features = sample_feature_frame();
+    let mut ohlcv = sample_ohlcv();
+    let timestamps = ohlcv.timestamp.as_mut().expect("fixture timestamps");
+    timestamps[7] += 1;
+    let message = assert_discovery_integrity_failure(features, ohlcv, "at bar 7");
+    assert!(message.contains("feature timestamp="));
+    assert!(message.contains("OHLC timestamp="));
+}
+
+#[test]
+fn discovery_integrity_accepts_identical_ohlc_and_feature_timestamps() {
+    let features = sample_feature_frame();
+    let ohlcv = sample_ohlcv();
+    assert_eq!(ohlcv.timestamp.as_ref(), Some(&features.timestamps));
+    validate_discovery_ohlc_integrity(&features, &ohlcv, &valid_discovery_config())
+        .expect("identical timestamp axes must pass integrity preflight");
+}
+
+#[test]
+fn discovery_integrity_accepts_valid_fixture_and_zero_volume() {
+    let features = sample_feature_frame();
+    let mut ohlcv = sample_ohlcv();
+    ohlcv.volume.as_mut().expect("fixture volume")[0] = 0.0;
+    validate_discovery_ohlc_integrity(&features, &ohlcv, &valid_discovery_config())
+        .expect("valid OHLC and zero volume must pass integrity preflight");
+}
+
+#[test]
+fn discovery_integrity_rejects_non_finite_volume_but_accepts_zero() {
+    let mut ohlcv = sample_ohlcv();
+    ohlcv.volume.as_mut().expect("fixture volume")[0] = f64::NAN;
+    assert_discovery_integrity_failure(sample_feature_frame(), ohlcv, "volume=NaN");
+}
+
+#[test]
+fn discovery_rejects_historical_zero_entry_bar_instead_of_ranking_it() {
+    let mut ohlcv = sample_ohlcv();
+    ohlcv.open[0] = 0.0;
+    ohlcv.high[0] = 0.83762;
+    ohlcv.low[0] = 0.0;
+    ohlcv.close[0] = 0.83417;
+    let message = assert_discovery_integrity_failure(sample_feature_frame(), ohlcv, "open=0");
+    assert!(message.contains("EURUSD M1 at bar 0"));
+}
+
 #[test]
 fn run_discovery_cycle_bails_on_empty_evaluation_symbol() {
     let features = sample_feature_frame();
