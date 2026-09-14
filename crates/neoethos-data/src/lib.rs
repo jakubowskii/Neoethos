@@ -1069,7 +1069,7 @@ fn append_feature_block(
 fn compute_aligned_higher_block(
     ds: &SymbolDataset,
     base_tf: &str,
-    base_ns: &[i64],
+    base_ms: &[i64],
     h_tf: &str,
     profile: FeatureProfile,
 ) -> Result<Option<(Vec<String>, Array2<f32>)>> {
@@ -1080,29 +1080,26 @@ fn compute_aligned_higher_block(
         return Ok(None);
     };
     let h_feats = compute_hpc_feature_frame(h_ohlcv, profile)?;
-    let h_ns = h_ohlcv
+    let h_ms = h_ohlcv
         .timestamp
         .as_ref()
         .context("higher tf has no timestamps")?;
     // F-308: cap forward-fill at 2× the higher-TF period so stale higher-TF
     // data becomes NaN (flagged downstream) instead of a frozen-constant
     // column that would feed the GA zero / look-alike signals.
-    let max_age_ns = parse_timeframe_to_minutes(h_tf)
-        .ok()
-        .filter(|m| *m > 0)
-        .map(|m| (m as i64).saturating_mul(60).saturating_mul(1_000_000_000).saturating_mul(2));
-    let base_last = base_ns.last().copied().unwrap_or(0);
-    let h_last = h_ns.last().copied().unwrap_or(0);
+    let max_age_ms = higher_timeframe_max_age_ms(h_tf);
+    let base_last = base_ms.last().copied().unwrap_or(0);
+    let h_last = h_ms.last().copied().unwrap_or(0);
     if base_last > 0 && h_last > 0 && base_last > h_last {
-        if let Some(max_age) = max_age_ns {
-            let lag_ns = base_last - h_last;
-            if lag_ns > max_age {
+        if let Some(max_age) = max_age_ms {
+            let lag_ms = base_last - h_last;
+            if lag_ms > max_age {
                 tracing::warn!(
                     target: "neoethos_data::prepare_multitimeframe_features",
                     base_tf = base_tf,
                     higher_tf = h_tf,
-                    lag_seconds = lag_ns / 1_000_000_000,
-                    max_age_seconds = max_age / 1_000_000_000,
+                    lag_seconds = lag_ms / 1_000,
+                    max_age_seconds = max_age / 1_000,
                     "higher-TF last bar is older than 2× period — feature columns past max_age will be NaN. Re-run --bootstrap-data for this (symbol, timeframe) to refresh."
                 );
             }
@@ -1119,8 +1116,15 @@ fn compute_aligned_higher_block(
             anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
         }
     };
-    let aligned = align_features_by_ns(base_ns, h_ns, &h_block, true, max_age_ns);
+    let aligned = align_features_by_ns(base_ms, h_ms, &h_block, true, max_age_ms);
     Ok(Some((h_names, aligned)))
+}
+
+fn higher_timeframe_max_age_ms(timeframe: &str) -> Option<i64> {
+    parse_timeframe_to_minutes(timeframe)
+        .ok()
+        .filter(|minutes| *minutes > 0)
+        .map(|minutes| minutes.saturating_mul(60_000).saturating_mul(2))
 }
 
 /// Normalise each column of an in-RAM feature block in place (robust z-score),
@@ -1176,12 +1180,12 @@ pub fn prepare_multitimeframe_features_with_options(
             "Base timeframe '{}' is missing from dataset '{}' — resample it first.",
             base_tf, ds.symbol
         ))?;
-    let base_ns = base_ohlcv
+    let base_ms = base_ohlcv
         .timestamp
         .as_ref()
         .context("base has no timestamps")?;
 
-    let n_samples = base_ns.len();
+    let n_samples = base_ms.len();
 
     // ── RAM-aware multi-resolution feature cube ───────────────────────────
     //
@@ -1273,7 +1277,7 @@ pub fn prepare_multitimeframe_features_with_options(
         blocks.push(base_block);
         for h_tf in &active_higher {
             if let Some((h_names, mut aligned)) =
-                compute_aligned_higher_block(ds, base_tf, base_ns, h_tf, opts.profile)?
+                compute_aligned_higher_block(ds, base_tf, base_ms, h_tf, opts.profile)?
             {
                 if normalize {
                     normalize_block_columns(&mut aligned);
@@ -1290,7 +1294,7 @@ pub fn prepare_multitimeframe_features_with_options(
         };
         drop(blocks);
         return Ok(FeatureFrame {
-            timestamps: base_ns.clone(),
+            timestamps: base_ms.clone(),
             names: all_names,
             data: crate::core::features::FeatureData::InMemory(cube),
         });
@@ -1306,7 +1310,7 @@ pub fn prepare_multitimeframe_features_with_options(
 
     for h_tf in &active_higher {
         if let Some((h_names, aligned)) =
-            compute_aligned_higher_block(ds, base_tf, base_ns, h_tf, opts.profile)?
+            compute_aligned_higher_block(ds, base_tf, base_ms, h_tf, opts.profile)?
         {
             all_names.extend(h_names);
             append_feature_block(&mut writer, &aligned, normalize)?;
@@ -1333,7 +1337,7 @@ pub fn prepare_multitimeframe_features_with_options(
     )?;
 
     Ok(FeatureFrame {
-        timestamps: base_ns.clone(),
+        timestamps: base_ms.clone(),
         names: all_names,
         data: crate::core::features::FeatureData::Mmap(std::sync::Arc::new(store)),
     })
@@ -1360,10 +1364,8 @@ mod tests {
     }
 
     fn h1_only_dataset(rows: usize) -> SymbolDataset {
-        let start = 1_700_000_000_000_000_000_i64;
-        let timestamp: Vec<i64> = (0..rows)
-            .map(|i| start + i as i64 * 3_600_000_000_000)
-            .collect();
+        let start = 1_699_920_000_000_i64;
+        let timestamp: Vec<i64> = (0..rows).map(|i| start + i as i64 * 3_600_000).collect();
         let close: Vec<f64> = (0..rows)
             .map(|i| 1.10 + (i as f64 * 0.03).sin() * 0.005)
             .collect();
@@ -1395,6 +1397,9 @@ mod tests {
         for tf in ["H1", "H4", "H12", "D1"] {
             assert!(ready.frames.contains_key(tf), "missing requested {tf}");
         }
+        assert_eq!(ready.frames["H4"].len(), 60);
+        assert_eq!(ready.frames["H12"].len(), 20);
+        assert_eq!(ready.frames["D1"].len(), 10);
 
         let legacy = prepare_multitimeframe_features(&ready, "H1", &["H4", "D1"], None)?;
         assert!(legacy.names.iter().any(|name| name.starts_with("H4_")));
@@ -1422,6 +1427,22 @@ mod tests {
         assert!(prefix_at("H4_") < prefix_at("H12_"));
         assert!(prefix_at("H12_") < prefix_at("D1_"));
         Ok(())
+    }
+
+    #[test]
+    fn higher_timeframe_alignment_expires_after_two_periods_in_milliseconds() {
+        let h4_period_ms = 14_400_000;
+        let max_age_ms = higher_timeframe_max_age_ms("H4").unwrap();
+        assert_eq!(max_age_ms, 2 * h4_period_ms);
+
+        let feature_ms = vec![1_699_920_000_000];
+        let base_ms = vec![feature_ms[0] + max_age_ms, feature_ms[0] + max_age_ms + 1];
+        let feature_data = ndarray::array![[42.0_f32]];
+        let aligned =
+            align_features_by_ns(&base_ms, &feature_ms, &feature_data, true, Some(max_age_ms));
+
+        assert_eq!(aligned[(0, 0)], 42.0);
+        assert!(aligned[(1, 0)].is_nan());
     }
 
     #[test]

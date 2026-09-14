@@ -246,6 +246,9 @@ impl FeatureFrame {
 /// so the operator sees explicit "stale higher-TF" warnings instead
 /// of silent zero-trade GA output.
 ///
+/// Despite the historical `*_ns` names, all timestamp arguments only need to
+/// share one unit. Production OHLCV and FeatureFrame callers use milliseconds.
+///
 /// `max_age_ns = None` preserves the legacy unbounded behaviour for
 /// callers that explicitly want it (e.g. UI chart preview where
 /// indicators on yesterday's last-known close are fine).

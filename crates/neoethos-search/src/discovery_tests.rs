@@ -1263,19 +1263,19 @@ fn post_ga_sizing_fixture() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<i64>, Vec<i8>,
 }
 
 #[test]
-fn discovery_quality_horizon_converts_feature_nanoseconds_to_milliseconds() {
+fn discovery_quality_horizon_preserves_feature_milliseconds() {
     let start_ms = 1_700_000_000_000_i64;
     let average_month_ms: f64 = 86_400_000.0 * (365.2425 / 12.0);
     let end_ms = start_ms + (91.8 * average_month_ms).round() as i64;
     let features = FeatureFrame {
-        timestamps: vec![start_ms * 1_000_000, end_ms * 1_000_000],
+        timestamps: vec![start_ms, end_ms],
         names: Vec::new(),
         data: neoethos_data::FeatureData::InMemory(ndarray::Array2::zeros((2, 0))),
     };
-    let (converted_start_ms, converted_end_ms) = quality_evaluation_horizon_ms(&features);
-    assert_eq!(converted_start_ms, 1_700_000_000_000);
-    assert_eq!(converted_end_ms, end_ms);
-    assert_ne!(converted_start_ms, features.timestamps[0]);
+    let (evaluation_start_ms, evaluation_end_ms) = quality_evaluation_horizon_ms(&features);
+    assert_eq!(evaluation_start_ms, start_ms);
+    assert_eq!(evaluation_end_ms, end_ms);
+    assert_ne!(evaluation_start_ms, start_ms / 1_000_000);
 
     let trades = (0..7)
         .map(|i| Trade {
@@ -1289,11 +1289,11 @@ fn discovery_quality_horizon_converts_feature_nanoseconds_to_milliseconds() {
         .collect::<Vec<_>>();
     let analyzer = StrategyQualityAnalyzer::default();
     let from_feature_boundary = analyzer.analyze_strategy_with_horizon(
-        "feature-ns",
+        "feature-ms",
         &trades,
         100_000.0,
-        converted_start_ms,
-        converted_end_ms,
+        evaluation_start_ms,
+        evaluation_end_ms,
     );
     let from_ms =
         analyzer.analyze_strategy_with_horizon("direct-ms", &trades, 100_000.0, start_ms, end_ms);
@@ -1304,7 +1304,7 @@ fn discovery_quality_horizon_converts_feature_nanoseconds_to_milliseconds() {
         from_ms.trades_per_month
     );
     assert!(from_feature_boundary.trades_per_month > 0.07);
-    assert!(from_feature_boundary.period_days < 3_000.0);
+    assert!((from_feature_boundary.period_days - 2_794.105125).abs() < 1e-6);
 }
 
 #[test]

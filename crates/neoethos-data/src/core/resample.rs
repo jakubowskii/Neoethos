@@ -24,7 +24,9 @@ pub fn parse_timeframe_to_minutes(tf: &str) -> Result<i64> {
 
 pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     let mins = parse_timeframe_to_minutes(target_tf)?;
-    let period_ns = mins * 60 * 1_000_000_000;
+    let period_ms = mins
+        .checked_mul(60_000)
+        .ok_or_else(|| anyhow::anyhow!("timeframe period overflow: {target_tf}"))?;
 
     let ts = src
         .timestamp
@@ -45,7 +47,7 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
         None
     };
 
-    let mut current_bucket_start = ts[0].div_euclid(period_ns) * period_ns;
+    let mut current_bucket_start = ts[0].div_euclid(period_ms) * period_ms;
     let mut b_open = src.open[0];
     let mut b_high = src.high[0];
     let mut b_low = src.low[0];
@@ -53,7 +55,7 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     let mut b_vol = src.volume.as_ref().map(|v| v[0]).unwrap_or(0.0);
 
     for i in 1..ts.len() {
-        let bucket = ts[i].div_euclid(period_ns) * period_ns;
+        let bucket = ts[i].div_euclid(period_ms) * period_ms;
         if bucket > current_bucket_start {
             resampled_ts.push(current_bucket_start);
             resampled_open.push(b_open);
@@ -95,6 +97,53 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
         close: resampled_close,
         volume: resampled_volume,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY_ALIGNED_START_MS: i64 = 1_699_920_000_000;
+
+    fn h1_ohlcv(rows: usize) -> Ohlcv {
+        let timestamp = (0..rows)
+            .map(|i| DAY_ALIGNED_START_MS + i as i64 * 3_600_000)
+            .collect();
+        let close: Vec<f64> = (0..rows).map(|i| 1.0 + i as f64 * 0.001).collect();
+        Ohlcv {
+            timestamp: Some(timestamp),
+            open: close.clone(),
+            high: close.iter().map(|value| value + 0.0005).collect(),
+            low: close.iter().map(|value| value - 0.0005).collect(),
+            close,
+            volume: None,
+        }
+    }
+
+    fn assert_spacing(ohlcv: &Ohlcv, expected_ms: i64) {
+        let timestamps = ohlcv.timestamp.as_ref().unwrap();
+        assert!(
+            timestamps
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] == expected_ms)
+        );
+    }
+
+    #[test]
+    fn resamples_millisecond_h1_into_correct_higher_timeframe_buckets() -> Result<()> {
+        let h4 = resample_ohlcv(&h1_ohlcv(24), "H4")?;
+        assert_eq!(h4.len(), 6);
+        assert_spacing(&h4, 14_400_000);
+
+        let source = h1_ohlcv(72);
+        let h12 = resample_ohlcv(&source, "H12")?;
+        let d1 = resample_ohlcv(&source, "D1")?;
+        assert_eq!(h12.len(), 6);
+        assert_eq!(d1.len(), 3);
+        assert_spacing(&h12, 43_200_000);
+        assert_spacing(&d1, 86_400_000);
+        Ok(())
+    }
 }
 
 /// Subset of `neoethos_core::CANONICAL_TIMEFRAMES` that downstream pipelines

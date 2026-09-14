@@ -1292,24 +1292,10 @@ fn quality_analyzer_for_config(config: &DiscoveryConfig) -> StrategyQualityAnaly
     }
 }
 
-fn feature_timestamp_ns_to_ms(timestamp_ns: i64) -> i64 {
-    timestamp_ns / 1_000_000
-}
-
 fn quality_evaluation_horizon_ms(features: &FeatureFrame) -> (i64, i64) {
     (
-        features
-            .timestamps
-            .first()
-            .copied()
-            .map(feature_timestamp_ns_to_ms)
-            .unwrap_or(0),
-        features
-            .timestamps
-            .last()
-            .copied()
-            .map(feature_timestamp_ns_to_ms)
-            .unwrap_or(0),
+        features.timestamps.first().copied().unwrap_or(0),
+        features.timestamps.last().copied().unwrap_or(0),
     )
 }
 
