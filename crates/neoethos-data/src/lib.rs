@@ -1214,13 +1214,31 @@ pub fn prepare_multitimeframe_features_with_options(
         }
     };
 
-    // Active higher TFs (present in the dataset, not the base).
-    let active_higher: Vec<String> = opts
-        .higher_tfs
-        .iter()
-        .filter(|h| h.as_str() != base_tf && ds.frames.contains_key(h.as_str()))
-        .cloned()
-        .collect();
+    // Requested higher TFs are an operator contract: normalize/deduplicate in
+    // first-seen order, and never silently omit a missing or unsupported block.
+    let base_minutes = parse_timeframe_to_minutes(base_tf)?;
+    let mut active_higher = Vec::new();
+    for requested in &opts.higher_tfs {
+        let h_tf = requested.trim().to_ascii_uppercase();
+        if h_tf.eq_ignore_ascii_case(base_tf) {
+            continue;
+        }
+        if !is_canonical_timeframe(&h_tf) {
+            anyhow::bail!("Unsupported requested higher timeframe: '{h_tf}'");
+        }
+        if parse_timeframe_to_minutes(&h_tf)? <= base_minutes {
+            anyhow::bail!("Requested higher timeframe '{h_tf}' is not above base '{base_tf}'");
+        }
+        if !ds.frames.contains_key(&h_tf) {
+            anyhow::bail!(
+                "Requested higher timeframe '{h_tf}' is missing for {} base {base_tf}; resample it first",
+                ds.symbol
+            );
+        }
+        if !active_higher.contains(&h_tf) {
+            active_higher.push(h_tf);
+        }
+    }
 
     // Per-TF feature count = base block width (same registry for every TF);
     // estimate the whole cube and pick RAM vs disk-mmap accordingly.
@@ -1324,6 +1342,7 @@ pub fn prepare_multitimeframe_features_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1338,6 +1357,112 @@ mod tests {
             std::process::id(),
             nonce
         ))
+    }
+
+    fn h1_only_dataset(rows: usize) -> SymbolDataset {
+        let start = 1_700_000_000_000_000_000_i64;
+        let timestamp: Vec<i64> = (0..rows)
+            .map(|i| start + i as i64 * 3_600_000_000_000)
+            .collect();
+        let close: Vec<f64> = (0..rows)
+            .map(|i| 1.10 + (i as f64 * 0.03).sin() * 0.005)
+            .collect();
+        let ohlcv = Ohlcv {
+            timestamp: Some(timestamp),
+            open: close.clone(),
+            high: close.iter().map(|v| v + 0.001).collect(),
+            low: close.iter().map(|v| v - 0.001).collect(),
+            close,
+            volume: None,
+        };
+        SymbolDataset {
+            symbol: "EURUSD".to_string(),
+            frames: HashMap::from([("H1".to_string(), ohlcv)]),
+        }
+    }
+
+    #[test]
+    fn requested_higher_timeframes_are_resampled_and_featured_once() -> Result<()> {
+        let mut ds = h1_only_dataset(240);
+        ds.symbol = "EURUSD_DEDUP".to_string();
+        let requested = ["H4", "h12", "D1", "H12"];
+        let targets: Vec<&str> = MANDATORY_TFS
+            .iter()
+            .copied()
+            .chain(requested.iter().copied())
+            .collect();
+        let ready = ensure_timeframes_with_resample(&ds, "H1", &targets)?;
+        for tf in ["H1", "H4", "H12", "D1"] {
+            assert!(ready.frames.contains_key(tf), "missing requested {tf}");
+        }
+
+        let legacy = prepare_multitimeframe_features(&ready, "H1", &["H4", "D1"], None)?;
+        assert!(legacy.names.iter().any(|name| name.starts_with("H4_")));
+        assert!(legacy.names.iter().any(|name| name.starts_with("D1_")));
+        drop(legacy);
+
+        let unique = prepare_multitimeframe_features(&ready, "H1", &["H4", "H12", "D1"], None)?;
+        let unique_names = unique.names.clone();
+        drop(unique);
+        let duplicate = prepare_multitimeframe_features(&ready, "H1", &requested, None)?;
+        assert_eq!(
+            duplicate.names, unique_names,
+            "duplicate H12 changed feature blocks"
+        );
+        assert!(duplicate.names.iter().any(|name| name.starts_with("H4_")));
+        assert!(duplicate.names.iter().any(|name| name.starts_with("H12_")));
+        assert!(duplicate.names.iter().any(|name| name.starts_with("D1_")));
+        let prefix_at = |prefix: &str| {
+            duplicate
+                .names
+                .iter()
+                .position(|name| name.starts_with(prefix))
+                .unwrap()
+        };
+        assert!(prefix_at("H4_") < prefix_at("H12_"));
+        assert!(prefix_at("H12_") < prefix_at("D1_"));
+        Ok(())
+    }
+
+    #[test]
+    fn requested_unsupported_timeframe_fails_loudly() {
+        let ds = h1_only_dataset(24);
+        let err = ensure_timeframes_with_resample(&ds, "H1", &["H2"])
+            .expect_err("unsupported requested timeframe must fail");
+        assert!(err.to_string().contains("Unsupported requested timeframe"));
+    }
+
+    #[test]
+    fn feature_prep_never_silently_drops_missing_requested_timeframe() {
+        let ds = h1_only_dataset(24);
+        let err = prepare_multitimeframe_features(&ds, "H1", &["H12"], None)
+            .expect_err("missing requested H12 must fail");
+        assert!(err.to_string().contains("H12"));
+        assert!(err.to_string().contains("resample it first"));
+    }
+
+    #[test]
+    fn feature_prep_rejects_explicit_timeframe_below_base() -> Result<()> {
+        let ds = ensure_timeframes_with_resample(&h1_only_dataset(240), "H1", &["H4"])?;
+        let err = prepare_multitimeframe_features(&ds, "H4", &["H1"], None)
+            .expect_err("explicit lower timeframe must fail");
+        assert!(err.to_string().contains("not above base 'H4'"));
+        Ok(())
+    }
+
+    #[test]
+    fn existing_higher_timeframe_is_preserved_by_current_policy() -> Result<()> {
+        let mut ds = h1_only_dataset(48);
+        let mut existing = resample_ohlcv(ds.frames.get("H1").unwrap(), "H12")?;
+        existing.open[0] = 42.0;
+        existing.high[0] = 42.0;
+        existing.low[0] = 42.0;
+        existing.close[0] = 42.0;
+        ds.frames.insert("H12".to_string(), existing);
+
+        let ready = ensure_timeframes_with_resample(&ds, "H1", &["H12"])?;
+        assert_eq!(ready.frames["H12"].close[0], 42.0);
+        Ok(())
     }
 
     fn write_valid_ohlcv_vortex(path: &Path) -> Result<()> {

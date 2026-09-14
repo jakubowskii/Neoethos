@@ -12,6 +12,24 @@ use neoethos_data::{
 use std::path::Path;
 use tracing::info;
 
+fn batch_higher_timeframes_for_base(configured: &[String], base: &str) -> Result<Vec<String>> {
+    let base_minutes = neoethos_data::parse_timeframe_to_minutes(base)?;
+    let mut resolved = Vec::new();
+    for raw_tf in configured {
+        let tf = raw_tf.trim().to_ascii_uppercase();
+        if !neoethos_core::is_canonical_timeframe(&tf) {
+            anyhow::bail!("Unsupported batch higher timeframe: '{tf}'");
+        }
+        if neoethos_data::parse_timeframe_to_minutes(&tf)? <= base_minutes {
+            continue;
+        }
+        if !resolved.contains(&tf) {
+            resolved.push(tf);
+        }
+    }
+    Ok(resolved)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BatchDiscoverySummary {
     pub symbols_seen: usize,
@@ -91,7 +109,14 @@ impl DiscoveryOrchestrator {
             for tf in timeframes {
                 summary.work_units_seen += 1;
                 info!("  Timeframe: {}", tf);
-                let ds_ready = match ensure_timeframes_with_resample(&ds, tf, MANDATORY_TFS) {
+                let higher_timeframes =
+                    batch_higher_timeframes_for_base(&self.config.higher_timeframes, tf)?;
+                let requested: Vec<&str> = MANDATORY_TFS
+                    .iter()
+                    .copied()
+                    .chain(higher_timeframes.iter().map(String::as_str))
+                    .collect();
+                let ds_ready = match ensure_timeframes_with_resample(&ds, tf, &requested) {
                     Ok(d) => d,
                     Err(e) => {
                         summary.skipped_timeframes += 1;
@@ -100,12 +125,7 @@ impl DiscoveryOrchestrator {
                     }
                 };
 
-                let htfs: Vec<&str> = self
-                    .config
-                    .higher_timeframes
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect();
+                let htfs: Vec<&str> = higher_timeframes.iter().map(String::as_str).collect();
                 let features = match prepare_multitimeframe_features(&ds_ready, tf, &htfs, None) {
                     Ok(f) => f,
                     Err(e) => {
@@ -125,6 +145,7 @@ impl DiscoveryOrchestrator {
                 };
                 let mut runtime_config = self.config.clone().apply_mode_overrides();
                 runtime_config.timeframe_label = tf.clone();
+                runtime_config.higher_timeframes = higher_timeframes;
                 // Bind the current symbol so the cost-model guard doesn't fire.
                 // The base config carries settings.system.symbol as a default,
                 // which is wrong for every symbol except the one in config.yaml.
@@ -226,5 +247,25 @@ mod tests {
             .finalize()
             .expect("expected non-empty batch success");
         assert_eq!(finalized.portfolios_saved, 1);
+    }
+
+    #[test]
+    fn batch_derives_ordered_higher_subset_for_each_base() {
+        let shared = vec!["H1", "H4", "D1", "d1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            batch_higher_timeframes_for_base(&shared, "H4").unwrap(),
+            vec!["D1"]
+        );
+    }
+
+    #[test]
+    fn batch_rejects_unsupported_shared_timeframe() {
+        let err = batch_higher_timeframes_for_base(&["H2".to_string()], "H1")
+            .expect_err("unsupported batch timeframe must fail");
+        assert!(err.to_string().contains("H2"));
     }
 }

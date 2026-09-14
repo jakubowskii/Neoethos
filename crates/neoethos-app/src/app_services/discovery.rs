@@ -864,8 +864,13 @@ pub fn start_discovery_job(
 
         let feature_request = request.clone();
         let feature_build = tokio::task::spawn_blocking(move || {
+            let requested: Vec<&str> = MANDATORY_TFS
+                .iter()
+                .copied()
+                .chain(feature_request.higher_tfs.iter().map(String::as_str))
+                .collect();
             let dataset =
-                ensure_timeframes_with_resample(&dataset, &feature_request.base_tf, MANDATORY_TFS)?;
+                ensure_timeframes_with_resample(&dataset, &feature_request.base_tf, &requested)?;
             let higher_refs: Vec<&str> = feature_request
                 .higher_tfs
                 .iter()

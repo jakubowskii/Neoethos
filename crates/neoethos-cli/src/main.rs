@@ -335,6 +335,19 @@ fn cmd_features(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn ensure_cli_timeframes(
+    dataset: &neoethos_data::SymbolDataset,
+    base: &str,
+    requested_higher: &[&str],
+) -> Result<neoethos_data::SymbolDataset> {
+    let targets: Vec<&str> = neoethos_data::MANDATORY_TFS
+        .iter()
+        .copied()
+        .chain(requested_higher.iter().copied())
+        .collect();
+    neoethos_data::ensure_timeframes_with_resample(dataset, base, &targets)
+}
+
 fn cmd_prepare(args: &[String]) -> Result<()> {
     let settings = resolve_cli_settings(args)?;
     let root = parse_root(args, settings.as_ref());
@@ -349,6 +362,7 @@ fn cmd_prepare(args: &[String]) -> Result<()> {
         .collect();
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
     let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
+    let dataset = ensure_cli_timeframes(&dataset, &base, &higher_refs)?;
     let cache = neoethos_data::FeatureCache::new("cache/features", 60, true);
     let features = neoethos_data::prepare_multitimeframe_features(
         &dataset,
@@ -914,11 +928,7 @@ fn cmd_search(args: &[String]) -> Result<()> {
     let higher_refs: Vec<&str> = higher_list.iter().map(|s| s.as_str()).collect();
 
     let dataset = neoethos_data::load_symbol_dataset(&root, &symbol)?;
-    let dataset = neoethos_data::ensure_timeframes_with_resample(
-        &dataset,
-        &base,
-        neoethos_data::MANDATORY_TFS,
-    )?;
+    let dataset = ensure_cli_timeframes(&dataset, &base, &higher_refs)?;
     let features = neoethos_data::prepare_multitimeframe_features(
         &dataset,
         &base,
@@ -1051,11 +1061,7 @@ fn cmd_discover(args: &[String]) -> Result<()> {
         let want_refs: Vec<&str> = want_tfs.iter().map(|s| s.as_str()).collect();
         let dataset =
             neoethos_data::load_symbol_dataset_with_timeframes(&root, &symbol, &want_refs)?;
-        let dataset = neoethos_data::ensure_timeframes_with_resample(
-            &dataset,
-            &base,
-            neoethos_data::MANDATORY_TFS,
-        )?;
+        let dataset = ensure_cli_timeframes(&dataset, &base, &higher_refs)?;
         let features = neoethos_data::prepare_multitimeframe_features(
             &dataset,
             &base,
@@ -2866,7 +2872,7 @@ fn system_time_string() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cli_record, section_record};
+    use super::{cli_record, ensure_cli_timeframes, section_record};
     use neoethos_core::sectioned_log::SubsystemSection;
 
     #[test]
@@ -2889,5 +2895,27 @@ mod tests {
         assert_eq!(record.operation, "discover");
         assert_eq!(record.status, "FAILED");
         assert_eq!(record.message, "discovery failed");
+    }
+
+    #[test]
+    fn prepare_contract_resamples_missing_requested_h12() {
+        let start = 1_700_000_000_000_000_000_i64;
+        let close = vec![1.10; 48];
+        let h1 = neoethos_data::Ohlcv {
+            timestamp: Some((0..48).map(|i| start + i * 3_600_000_000_000).collect()),
+            open: close.clone(),
+            high: vec![1.11; 48],
+            low: vec![1.09; 48],
+            close,
+            volume: None,
+        };
+        let dataset = neoethos_data::SymbolDataset {
+            symbol: "EURUSD".to_string(),
+            frames: std::collections::HashMap::from([("H1".to_string(), h1)]),
+        };
+
+        let ready = ensure_cli_timeframes(&dataset, "H1", &["H12"])
+            .expect("prepare --higher H12 must resample missing H12");
+        assert!(ready.frames.contains_key("H12"));
     }
 }
