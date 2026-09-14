@@ -22,6 +22,14 @@ pub fn parse_timeframe_to_minutes(tf: &str) -> Result<i64> {
     }
 }
 
+fn inferred_source_period_ms(timestamps: &[i64]) -> Option<i64> {
+    timestamps
+        .windows(2)
+        .filter_map(|pair| pair[1].checked_sub(pair[0]))
+        .filter(|delta| *delta > 0)
+        .min()
+}
+
 pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
     let mins = parse_timeframe_to_minutes(target_tf)?;
     let period_ms = mins
@@ -79,14 +87,23 @@ pub fn resample_ohlcv(src: &Ohlcv, target_tf: &str) -> Result<Ohlcv> {
             b_vol += src.volume.as_ref().map(|v| v[i]).unwrap_or(0.0);
         }
     }
-    // Last bucket
-    resampled_ts.push(current_bucket_start);
-    resampled_open.push(b_open);
-    resampled_high.push(b_high);
-    resampled_low.push(b_low);
-    resampled_close.push(b_close);
-    if let Some(ref mut v) = resampled_volume {
-        v.push(b_vol);
+    // Keep the final bucket only when the last source bar's close boundary
+    // reaches the target bucket boundary. Missing constituent bars are valid
+    // across FX session gaps; exact bar counts are deliberately not required.
+    let bucket_end_ms = current_bucket_start
+        .checked_add(period_ms)
+        .ok_or_else(|| anyhow::anyhow!("resample bucket boundary overflow: {target_tf}"))?;
+    let source_end_ms = inferred_source_period_ms(ts)
+        .and_then(|source_period_ms| ts.last()?.checked_add(source_period_ms));
+    if source_end_ms.is_some_and(|end_ms| end_ms >= bucket_end_ms) {
+        resampled_ts.push(current_bucket_start);
+        resampled_open.push(b_open);
+        resampled_high.push(b_high);
+        resampled_low.push(b_low);
+        resampled_close.push(b_close);
+        if let Some(ref mut v) = resampled_volume {
+            v.push(b_vol);
+        }
     }
 
     Ok(Ohlcv {
@@ -142,6 +159,40 @@ mod tests {
         assert_eq!(d1.len(), 3);
         assert_spacing(&h12, 43_200_000);
         assert_spacing(&d1, 86_400_000);
+        Ok(())
+    }
+
+    #[test]
+    fn completed_h4_keeps_open_timestamp_and_excludes_next_bucket() -> Result<()> {
+        let source = h1_ohlcv(5);
+        let h4 = resample_ohlcv(&source, "H4")?;
+
+        assert_eq!(h4.len(), 1);
+        assert_eq!(h4.timestamp.as_deref(), Some(&[DAY_ALIGNED_START_MS][..]));
+        assert_eq!(h4.open[0], source.open[0]);
+        assert_eq!(h4.high[0], source.high[..4].iter().copied().fold(f64::NEG_INFINITY, f64::max));
+        assert_eq!(h4.low[0], source.low[..4].iter().copied().fold(f64::INFINITY, f64::min));
+        assert_eq!(h4.close[0], source.close[3]);
+        assert_ne!(h4.close[0], source.close[4]);
+        Ok(())
+    }
+
+    #[test]
+    fn h12_and_d1_keep_only_closed_buckets() -> Result<()> {
+        let h12 = resample_ohlcv(&h1_ohlcv(13), "H12")?;
+        let d1 = resample_ohlcv(&h1_ohlcv(25), "D1")?;
+
+        assert_eq!(h12.len(), 1);
+        assert_eq!(d1.len(), 1);
+        assert_eq!(h12.timestamp.as_deref(), Some(&[DAY_ALIGNED_START_MS][..]));
+        assert_eq!(d1.timestamp.as_deref(), Some(&[DAY_ALIGNED_START_MS][..]));
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_final_higher_timeframe_bucket_is_excluded() -> Result<()> {
+        assert!(resample_ohlcv(&h1_ohlcv(3), "H4")?.is_empty());
+        assert_eq!(resample_ohlcv(&h1_ohlcv(7), "H4")?.len(), 1);
         Ok(())
     }
 }
@@ -207,24 +258,29 @@ pub fn ensure_timeframes_with_resample(
         if let Some(existing) = new_frames.get(&tf) {
             // Existing higher-TF: check freshness if requested.
             if rebuild_stale && base_last_ts > 0 {
-                let h_last = existing
+                let h_last_open_ms = existing
                     .timestamp
                     .as_ref()
                     .and_then(|ts| ts.last())
                     .copied()
                     .unwrap_or(0);
+                let h_last_available_ms = h_last_open_ms
+                    .saturating_add(tf_minutes.saturating_mul(60_000));
                 // 2× period lag = stale (matches F-308 max_age policy)
                 let max_lag_ms = (tf_minutes as i64)
                     .saturating_mul(60 * 1000)
                     .saturating_mul(2);
-                if h_last > 0 && base_last_ts.saturating_sub(h_last) > max_lag_ms {
+                if h_last_open_ms > 0
+                    && base_last_ts.saturating_sub(h_last_available_ms) > max_lag_ms
+                {
                     tracing::warn!(
                         target: "neoethos_data::ensure_timeframes_with_resample",
                         symbol = %ds.symbol,
                         tf = tf,
                         base_last_ms = base_last_ts,
-                        h_last_ms = h_last,
-                        lag_ms = base_last_ts - h_last,
+                        h_last_open_ms,
+                        h_last_available_ms,
+                        lag_ms = base_last_ts - h_last_available_ms,
                         max_lag_ms,
                         "F-309: rebuilding stale higher-TF from base via resample"
                     );

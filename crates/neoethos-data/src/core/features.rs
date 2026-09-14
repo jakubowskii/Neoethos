@@ -239,28 +239,28 @@ impl FeatureFrame {
 /// produce zero or look-alike signals, and the discovery funnel would
 /// report `ranked=N, post_passes_filter=0` with no diagnostic.
 ///
-/// `max_age_ns` (Some) caps the forward-fill: if the chosen previous
-/// higher-TF timestamp is more than `max_age_ns` older than the
+/// `max_age_ms` (Some) caps the forward-fill: if the chosen previous
+/// feature availability timestamp is more than `max_age_ms` older than the
 /// current base timestamp, the row is left NaN. NaN propagates
 /// through the downstream NaN counter (`discovery.rs::feature_cube_summary`)
 /// so the operator sees explicit "stale higher-TF" warnings instead
 /// of silent zero-trade GA output.
 ///
-/// Despite the historical `*_ns` names, all timestamp arguments only need to
-/// share one unit. Production OHLCV and FeatureFrame callers use milliseconds.
+/// Production callers pass millisecond base timestamps and closed-bar
+/// availability timestamps (`higher_open_ms + higher_period_ms`).
 ///
-/// `max_age_ns = None` preserves the legacy unbounded behaviour for
+/// `max_age_ms = None` preserves the legacy unbounded behaviour for
 /// callers that explicitly want it (e.g. UI chart preview where
 /// indicators on yesterday's last-known close are fine).
 pub fn align_features_by_ns(
-    base_ns: &[i64],
-    feature_ns: &[i64],
+    base_ms: &[i64],
+    feature_available_at_ms: &[i64],
     feature_data: &Array2<f32>,
     ffill: bool,
-    max_age_ns: Option<i64>,
+    max_age_ms: Option<i64>,
 ) -> Array2<f32> {
-    let n_base = base_ns.len();
-    let n_feat = feature_ns.len();
+    let n_base = base_ms.len();
+    let n_feat = feature_available_at_ms.len();
     let n_cols = feature_data.ncols();
     let mut out = Array2::from_elem((n_base, n_cols), f32::NAN);
 
@@ -270,20 +270,20 @@ pub fn align_features_by_ns(
 
     let mut feat_idx = 0usize;
     for i in 0..n_base {
-        let ts = base_ns[i];
-        while feat_idx < n_feat && feature_ns[feat_idx] <= ts {
+        let ts = base_ms[i];
+        while feat_idx < n_feat && feature_available_at_ms[feat_idx] <= ts {
             feat_idx += 1;
         }
 
         let best_idx = if feat_idx > 0 {
             let prev = feat_idx - 1;
-            if feature_ns[prev] == ts {
+            if feature_available_at_ms[prev] == ts {
                 Some(prev)
             } else if ffill {
                 // F-308 max-age guard: drop the forward-fill when the
                 // most-recent higher-TF bar is older than the cap.
-                match max_age_ns {
-                    Some(max_age) if ts - feature_ns[prev] > max_age => None,
+                match max_age_ms {
+                    Some(max_age) if ts - feature_available_at_ms[prev] > max_age => None,
                     _ => Some(prev),
                 }
             } else {
@@ -305,6 +305,8 @@ pub fn align_features_by_ns(
 #[cfg(test)]
 mod align_tests {
     use super::*;
+    use crate::Ohlcv;
+    use crate::core::resample::resample_ohlcv;
     use ndarray::array;
 
     fn ns_grid(start_min: i64, step_min: i64, n: usize) -> Vec<i64> {
@@ -417,5 +419,80 @@ mod align_tests {
         for i in 51..100 {
             assert!(aligned[(i, 0)].is_nan(), "expected NaN at i={i}, got {}", aligned[(i, 0)]);
         }
+    }
+
+    #[test]
+    fn h4_feature_with_final_constituent_spike_is_available_only_at_04() {
+        const HOUR_MS: i64 = 3_600_000;
+        let source = Ohlcv {
+            timestamp: Some((0..5).map(|hour| hour * HOUR_MS).collect()),
+            open: vec![1.0; 5],
+            high: vec![1.1, 1.1, 1.1, 1_000.0, 1.1],
+            low: vec![0.9; 5],
+            close: vec![1.0, 1.0, 1.0, 999.0, 1.0],
+            volume: None,
+        };
+        let h4 = resample_ohlcv(&source, "H4").unwrap();
+        let h4_open_ms = h4.timestamp.as_ref().unwrap()[0];
+        let h4_available_at_ms = [h4_open_ms + 4 * HOUR_MS];
+        let feature_data = array![[h4.close[0] as f32]];
+        let base_ms = source.timestamp.as_ref().unwrap();
+
+        let aligned = align_features_by_ns(
+            base_ms,
+            &h4_available_at_ms,
+            &feature_data,
+            true,
+            None,
+        );
+
+        for row in 0..4 {
+            assert!(aligned[(row, 0)].is_nan());
+        }
+        assert_eq!(aligned[(4, 0)], 999.0);
+    }
+
+    #[test]
+    fn h12_and_d1_features_wait_for_their_close_boundaries() {
+        const HOUR_MS: i64 = 3_600_000;
+        let base_ms: Vec<i64> = (0..=24).map(|hour| hour * HOUR_MS).collect();
+        let h12 = align_features_by_ns(
+            &base_ms,
+            &[12 * HOUR_MS],
+            &array![[12.0_f32]],
+            true,
+            None,
+        );
+        let d1 = align_features_by_ns(
+            &base_ms,
+            &[24 * HOUR_MS],
+            &array![[24.0_f32]],
+            true,
+            None,
+        );
+
+        assert!(h12[(11, 0)].is_nan());
+        assert_eq!(h12[(12, 0)], 12.0);
+        assert!(d1[(23, 0)].is_nan());
+        assert_eq!(d1[(24, 0)], 24.0);
+    }
+
+    #[test]
+    fn max_age_is_measured_from_closed_bar_availability() {
+        const HOUR_MS: i64 = 3_600_000;
+        let available_at_ms = 4 * HOUR_MS;
+        let max_age_ms = 8 * HOUR_MS;
+        let base_ms = [available_at_ms, available_at_ms + max_age_ms, available_at_ms + max_age_ms + 1];
+        let aligned = align_features_by_ns(
+            &base_ms,
+            &[available_at_ms],
+            &array![[42.0_f32]],
+            true,
+            Some(max_age_ms),
+        );
+
+        assert_eq!(aligned[(0, 0)], 42.0);
+        assert_eq!(aligned[(1, 0)], 42.0);
+        assert!(aligned[(2, 0)].is_nan());
     }
 }

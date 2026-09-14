@@ -1084,15 +1084,26 @@ fn compute_aligned_higher_block(
         .timestamp
         .as_ref()
         .context("higher tf has no timestamps")?;
+    let h_period_ms = parse_timeframe_to_minutes(h_tf)?
+        .checked_mul(60_000)
+        .context("higher timeframe period overflow")?;
+    let h_available_at_ms: Vec<i64> = h_ms
+        .iter()
+        .map(|open_ms| {
+            open_ms
+                .checked_add(h_period_ms)
+                .context("higher timeframe availability overflow")
+        })
+        .collect::<Result<_>>()?;
     // F-308: cap forward-fill at 2× the higher-TF period so stale higher-TF
     // data becomes NaN (flagged downstream) instead of a frozen-constant
     // column that would feed the GA zero / look-alike signals.
     let max_age_ms = higher_timeframe_max_age_ms(h_tf);
     let base_last = base_ms.last().copied().unwrap_or(0);
-    let h_last = h_ms.last().copied().unwrap_or(0);
-    if base_last > 0 && h_last > 0 && base_last > h_last {
+    let h_last_available = h_available_at_ms.last().copied().unwrap_or(0);
+    if base_last > 0 && h_last_available > 0 && base_last > h_last_available {
         if let Some(max_age) = max_age_ms {
-            let lag_ms = base_last - h_last;
+            let lag_ms = base_last - h_last_available;
             if lag_ms > max_age {
                 tracing::warn!(
                     target: "neoethos_data::prepare_multitimeframe_features",
@@ -1116,7 +1127,13 @@ fn compute_aligned_higher_block(
             anyhow::bail!("compute_hpc_feature_frame must return an in-memory frame")
         }
     };
-    let aligned = align_features_by_ns(base_ms, h_ms, &h_block, true, max_age_ms);
+    let aligned = align_features_by_ns(
+        base_ms,
+        &h_available_at_ms,
+        &h_block,
+        true,
+        max_age_ms,
+    );
     Ok(Some((h_names, aligned)))
 }
 
@@ -1435,14 +1452,57 @@ mod tests {
         let max_age_ms = higher_timeframe_max_age_ms("H4").unwrap();
         assert_eq!(max_age_ms, 2 * h4_period_ms);
 
-        let feature_ms = vec![1_699_920_000_000];
-        let base_ms = vec![feature_ms[0] + max_age_ms, feature_ms[0] + max_age_ms + 1];
+        let feature_available_at_ms = vec![1_699_920_000_000];
+        let base_ms = vec![
+            feature_available_at_ms[0] + max_age_ms,
+            feature_available_at_ms[0] + max_age_ms + 1,
+        ];
         let feature_data = ndarray::array![[42.0_f32]];
-        let aligned =
-            align_features_by_ns(&base_ms, &feature_ms, &feature_data, true, Some(max_age_ms));
+        let aligned = align_features_by_ns(
+            &base_ms,
+            &feature_available_at_ms,
+            &feature_data,
+            true,
+            Some(max_age_ms),
+        );
 
         assert_eq!(aligned[(0, 0)], 42.0);
         assert!(aligned[(1, 0)].is_nan());
+    }
+
+    #[test]
+    fn production_h4_feature_block_is_hidden_until_bucket_close() -> Result<()> {
+        let mut ds = h1_only_dataset(5);
+        let h1 = ds.frames.get_mut("H1").unwrap();
+        h1.open[3] = 999.0;
+        h1.high[3] = 1_000.0;
+        h1.low[3] = 998.0;
+        h1.close[3] = 999.5;
+
+        let ready = ensure_timeframes_with_resample(&ds, "H1", &["H4"])?;
+        let h4_features = compute_hpc_feature_frame(&ready.frames["H4"], FeatureProfile::Standard)?;
+        let features = prepare_multitimeframe_features(&ready, "H1", &["H4"], None)?;
+        let h4_columns: Vec<usize> = features
+            .names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| name.starts_with("H4_").then_some(index))
+            .collect();
+
+        assert!(!h4_columns.is_empty());
+        for row in 0..4 {
+            assert!(h4_columns.iter().all(|column| features.feature_at(row, *column).is_nan()));
+        }
+        for (higher_column, output_column) in h4_columns.iter().enumerate() {
+            let actual = features.feature_at(4, *output_column);
+            let expected = h4_features.feature_at(0, higher_column);
+            assert!(
+                (actual.is_nan() && expected.is_nan()) || actual == expected,
+                "H4 feature column {} differs at first availability",
+                features.names[*output_column]
+            );
+        }
+        Ok(())
     }
 
     #[test]

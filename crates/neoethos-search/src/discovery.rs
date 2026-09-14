@@ -1857,7 +1857,7 @@ fn evaluate_robustness_evidence(
         .iter()
         .filter(|value| **value >= real_net)
         .count();
-    let p_value = beats as f64 / permutation_nets.len() as f64;
+    let p_value = (beats + 1) as f64 / (permutation_nets.len() + 1) as f64;
     result.permutation_executed = true;
     result.permutation_passed = p_value < PERMUTATION_P_VALUE_MAX;
     result.permutation_p_value = Some(p_value);

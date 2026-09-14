@@ -370,7 +370,7 @@ fn mark_all_mandatory_gates_passed(result: &mut DiscoveryResult) {
             pbo_splits: 1,
             permutation_executed: true,
             permutation_passed: true,
-            permutation_p_value: Some(0.0),
+            permutation_p_value: Some(1.0 / (N_PERMUTATIONS as f64 + 1.0)),
             permutation_samples: N_PERMUTATIONS,
             plateau_executed: true,
             plateau_passed: true,
@@ -1098,6 +1098,63 @@ fn permutation_signal_mismatch_fails_closed() {
     let result = evaluate_robustness_evidence(100.0, 30, None, &[]);
     assert!(!result.permutation_executed);
     assert!(!result.permutation_passed);
+}
+
+fn permutation_nets_with_beats(real_net: f64, beats: usize) -> Vec<f64> {
+    let mut nets = vec![real_net - 1.0; N_PERMUTATIONS];
+    nets.iter_mut().take(beats).for_each(|net| *net = real_net);
+    nets
+}
+
+#[test]
+fn permutation_zero_beats_uses_corrected_positive_p_value_and_passes() {
+    let result = evaluate_robustness_evidence(
+        100.0,
+        30,
+        Some(&permutation_nets_with_beats(100.0, 0)),
+        &[],
+    );
+    assert_eq!(result.permutation_samples, 50);
+    assert!((result.permutation_p_value.unwrap() - 1.0 / 51.0).abs() < f64::EPSILON);
+    assert!(result.permutation_passed);
+}
+
+#[test]
+fn permutation_one_beat_uses_corrected_p_value_and_passes() {
+    let result = evaluate_robustness_evidence(
+        100.0,
+        30,
+        Some(&permutation_nets_with_beats(100.0, 1)),
+        &[],
+    );
+    assert!((result.permutation_p_value.unwrap() - 2.0 / 51.0).abs() < f64::EPSILON);
+    assert!(result.permutation_passed);
+}
+
+#[test]
+fn permutation_two_beats_uses_corrected_p_value_and_fails() {
+    let result = evaluate_robustness_evidence(
+        100.0,
+        30,
+        Some(&permutation_nets_with_beats(100.0, 2)),
+        &[],
+    );
+    assert!((result.permutation_p_value.unwrap() - 3.0 / 51.0).abs() < f64::EPSILON);
+    assert!(!result.permutation_passed);
+}
+
+#[test]
+fn permutation_p_value_is_positive_for_every_valid_50_sample_outcome() {
+    for beats in 0..=N_PERMUTATIONS {
+        let result = evaluate_robustness_evidence(
+            100.0,
+            30,
+            Some(&permutation_nets_with_beats(100.0, beats)),
+            &[],
+        );
+        assert!(result.permutation_p_value.unwrap() > 0.0);
+        assert_eq!(result.permutation_samples, N_PERMUTATIONS);
+    }
 }
 
 #[test]
