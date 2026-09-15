@@ -7,6 +7,7 @@ pub mod bootstrap_writer;
 // of reading `std::env::var` directly.
 pub mod env_overrides;
 pub mod broker_config;
+pub mod broker_financial_truth;
 pub mod broker_persistence;
 pub mod ctrader_account;
 pub mod ctrader_auth;

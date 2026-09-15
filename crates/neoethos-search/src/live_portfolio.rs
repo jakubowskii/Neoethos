@@ -28,6 +28,7 @@ use neoethos_core::contracts::{
     ArtifactEnvelope, LivePromotionGate, LiveValidationEvidence, ValidationEvidenceKind,
     ValidationEvidenceManifest,
 };
+use neoethos_core::BrokerFinancialTruthReport;
 use serde::{Deserialize, Serialize};
 
 use crate::artifact_io::stable_json_hash;
@@ -55,6 +56,10 @@ pub struct LivePortfolioArtifact {
     pub normalize_features: bool,
     /// Candidate or promoted portfolio — FULL genes, including SMC flags + SL/TP.
     pub genes: Vec<Gene>,
+    /// Financial inputs are independent from statistical validation. Discovery
+    /// produces mechanical evidence unless validated broker truth is attached.
+    #[serde(default)]
+    pub broker_financial_truth: BrokerFinancialTruthReport,
     /// Explicit live boundary. Missing on legacy artifacts, therefore `false`.
     #[serde(default)]
     pub promotion_ready: bool,
@@ -77,6 +82,8 @@ pub struct LivePortfolioPromotionProof {
     pub artifact: ArtifactEnvelope<String>,
     pub evidence_manifest: ValidationEvidenceManifest,
     pub validation_evidence: LiveValidationEvidence,
+    #[serde(default)]
+    pub broker_financial_truth: BrokerFinancialTruthReport,
 }
 
 impl LivePortfolioArtifact {
@@ -95,6 +102,9 @@ impl LivePortfolioArtifact {
             effective_feature_names: result.effective_feature_names.clone(),
             normalize_features,
             genes: result.portfolio.clone(),
+            broker_financial_truth: BrokerFinancialTruthReport::mechanical(
+                "discovery_ohlc_cost_model_is_not_synchronized_broker_bid_ask",
+            ),
             promotion_ready: false,
             promotion_missing_evidence: Vec::new(),
             promotion_failed_evidence: Vec::new(),
@@ -109,6 +119,7 @@ impl LivePortfolioArtifact {
         promotion: LivePortfolioPromotionProof,
     ) -> anyhow::Result<Self> {
         self.validate_promotion(&promotion)?;
+        self.broker_financial_truth = promotion.broker_financial_truth.clone();
         self.promotion_ready = true;
         self.promotion_missing_evidence.clear();
         self.promotion_failed_evidence.clear();
@@ -134,6 +145,9 @@ impl LivePortfolioArtifact {
             .promotion
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("live portfolio promotion proof is missing"))?;
+        self.broker_financial_truth
+            .require_live()
+            .map_err(anyhow::Error::new)?;
         self.validate_promotion(promotion)
     }
 
@@ -149,6 +163,16 @@ impl LivePortfolioArtifact {
     }
 
     fn validate_promotion(&self, promotion: &LivePortfolioPromotionProof) -> anyhow::Result<()> {
+        promotion
+            .broker_financial_truth
+            .require_live()
+            .map_err(anyhow::Error::new)?;
+        if self.promotion_ready
+            && self.broker_financial_truth.truth_hash
+                != promotion.broker_financial_truth.truth_hash
+        {
+            anyhow::bail!("live portfolio broker financial truth proof does not match artifact");
+        }
         if promotion.artifact.payload != self.subject_hash()? {
             anyhow::bail!("live portfolio promotion proof does not match portfolio contents");
         }
@@ -156,6 +180,19 @@ impl LivePortfolioArtifact {
             anyhow::bail!("live portfolio promotion must require deterministic provenance");
         }
         let contract = &promotion.gate.live_execution_contract;
+        if promotion.broker_financial_truth.symbol.as_deref() != Some(self.symbol.as_str()) {
+            anyhow::bail!("broker financial truth does not bind this symbol");
+        }
+        if promotion.broker_financial_truth.strategy_hash.as_deref()
+            != Some(promotion.artifact.payload.as_str())
+        {
+            anyhow::bail!("broker financial truth does not bind this portfolio");
+        }
+        if promotion.broker_financial_truth.risk_config_hash.as_deref()
+            != Some(contract.risk_config_hash.as_str())
+        {
+            anyhow::bail!("broker financial truth does not bind live risk configuration");
+        }
         if !contract.require_walkforward_pass {
             anyhow::bail!("live portfolio promotion must require walkforward evidence");
         }
@@ -367,6 +404,7 @@ mod tests {
             ],
             normalize_features: false,
             genes: vec![gene],
+            broker_financial_truth: BrokerFinancialTruthReport::mechanical("test candidate"),
             promotion_ready: false,
             promotion_missing_evidence: ValidationEvidenceKind::ALL.to_vec(),
             promotion_failed_evidence: Vec::new(),
@@ -375,6 +413,7 @@ mod tests {
     }
 
     fn complete_promotion(artifact: &LivePortfolioArtifact) -> LivePortfolioPromotionProof {
+        let risk_config_hash = binding_hash("risk");
         let provenance = ArtifactProvenance::new(
             ArtifactKind::LiveReadyStrategy,
             "feature-schema",
@@ -387,7 +426,7 @@ mod tests {
             "training",
             "search",
             "runtime",
-            "risk",
+            &risk_config_hash,
             DeterminismPolicy::Deterministic { seed: 42 },
             "hardware",
             DeviceAssignment::cpu(),
@@ -403,7 +442,7 @@ mod tests {
             "availability",
             "symbols",
             "runtime",
-            "risk",
+            &risk_config_hash,
         )
         .with_required_walkforward_pass()
         .with_required_forward_test_pass()
@@ -432,7 +471,156 @@ mod tests {
             artifact: envelope,
             evidence_manifest,
             validation_evidence,
+            broker_financial_truth: live_broker_truth_report(
+                artifact.subject_hash().unwrap(),
+                risk_config_hash,
+            ),
         }
+    }
+
+    fn binding_hash(label: &str) -> String {
+        format!(
+            "fnv64:{:016x}",
+            neoethos_core::utils::fnv1a64(label.as_bytes())
+        )
+    }
+
+    fn live_broker_truth_report(
+        strategy_hash: String,
+        risk_config_hash: String,
+    ) -> BrokerFinancialTruthReport {
+        use neoethos_core::{
+            BrokerCloseDeal, BrokerPositionFinancialRow, BrokerPositionFinancialSnapshot,
+            CommissionTypeExact, ConversionBook, EvidenceProvenance, ExactCommissionSchedule,
+            ExactProtoOaSymbolContract, ExactSwapSchedule, ExactTradingInterval,
+            ExpectedLocalClose, HistoricalBrokerTruthEvidence, LiveBrokerTruthEvidence,
+            MinimumCommissionCurrency, PositionDirection, SwapCalculationExact,
+            SynchronizedBidAsk, SynchronizedQuote, reconcile_close_deals,
+        };
+        let provenance = |name: &str| {
+            EvidenceProvenance::new(
+                name,
+                1_700_000_000_000,
+                format!("fnv64:{:016x}", neoethos_core::utils::fnv1a64(name.as_bytes())),
+            )
+            .unwrap()
+        };
+        let contract = ExactProtoOaSymbolContract::new(
+            7,
+            5,
+            "GBP",
+            1,
+            "EURGBP",
+            4,
+            "EUR",
+            5,
+            "GBP",
+            5,
+            4,
+            10_000_000,
+            100_000,
+            1_000_000_000,
+            100_000,
+            ExactCommissionSchedule {
+                commission_type: CommissionTypeExact::QuoteCurrencyPerLot,
+                rate: 0.0,
+                minimum_per_deal: 0.0,
+                minimum_currency: MinimumCommissionCurrency::Quote,
+                minimum_asset: "GBP".to_string(),
+            },
+            ExactSwapSchedule {
+                calculation: SwapCalculationExact::Pips,
+                long: 0.0,
+                short: 0.0,
+                period_hours: 24,
+                time_minutes_from_utc_midnight: 0,
+                triple_day: Some(3),
+                skip_periods: 0,
+                charge_at_weekends: false,
+            },
+            0.0,
+            true,
+            "UTC",
+            vec![ExactTradingInterval {
+                start_second_from_sunday: 1,
+                end_second_from_sunday: 604_800,
+            }],
+            vec![],
+            provenance("symbol"),
+        )
+        .unwrap();
+        let quotes = SynchronizedBidAsk::new(
+            1,
+            "EURGBP",
+            vec![SynchronizedQuote {
+                timestamp_ms: 1_000,
+                bid: 0.85,
+                ask: 0.8502,
+            }],
+            "fnv64:0000000000000001",
+            "fnv64:0000000000000002",
+            provenance("quotes"),
+        )
+        .unwrap();
+        let historical = HistoricalBrokerTruthEvidence::new(
+            contract,
+            quotes,
+            ConversionBook::new("GBP", vec![]).unwrap(),
+            10_000.0,
+            risk_config_hash,
+            strategy_hash,
+            binding_hash("slippage"),
+        )
+        .unwrap();
+        let positions = BrokerPositionFinancialSnapshot::new(
+            7,
+            "GBP",
+            1_700_000_000_000,
+            i64::MAX / 4,
+            vec![BrokerPositionFinancialRow {
+                position_id: 9,
+                symbol_id: 1,
+                direction: PositionDirection::Long,
+                volume_units: 1_000.0,
+                entry_price: 0.85,
+                gross_unrealized_pnl_account: 1.0,
+                net_unrealized_pnl_account: 0.9,
+                swap_account: Some(0.0),
+                commission_account: Some(-0.1),
+            }],
+            provenance("positions"),
+        )
+        .unwrap();
+        let reconciliation = reconcile_close_deals(
+            ExpectedLocalClose {
+                account_id: 7,
+                symbol_id: 1,
+                position_id: 10,
+                direction: PositionDirection::Long,
+                expected_volume_units: 1_000.0,
+                local_estimated_pnl_account: Some(0.5),
+            },
+            vec![BrokerCloseDeal {
+                deal_id: 11,
+                order_id: 12,
+                position_id: 10,
+                symbol_id: 1,
+                direction: PositionDirection::Short,
+                filled_volume_units: 1_000.0,
+                execution_timestamp_ms: 2_000,
+                gross_profit_account: 1.0,
+                commission_account: -0.1,
+                swap_account: 0.0,
+                conversion_fee_account: 0.0,
+                net_profit_account: 0.9,
+            }],
+            provenance("deals"),
+        )
+        .unwrap();
+        BrokerFinancialTruthReport::live(
+            &LiveBrokerTruthEvidence::new(historical, positions, vec![reconciliation]).unwrap(),
+        )
+        .unwrap()
     }
 
     fn temp_portfolio_path(name: &str) -> std::path::PathBuf {
@@ -566,6 +754,64 @@ mod tests {
         std::fs::write(&path, json).unwrap();
         load_live_ready_portfolio_json(&path).expect("strict loader must accept complete proof");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn validation_evidence_cannot_promote_without_live_broker_truth() {
+        let artifact = candidate_artifact();
+        let mut proof = complete_promotion(&artifact);
+        proof.broker_financial_truth =
+            BrokerFinancialTruthReport::mechanical("explicit_spread_pips=1.0");
+        let error = artifact
+            .with_validated_promotion(proof)
+            .expect_err("mechanical financial inputs must never pass live promotion");
+        assert!(
+            error
+                .to_string()
+                .contains(neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1)
+        );
+    }
+
+    #[test]
+    fn broker_truth_for_another_portfolio_cannot_promote() {
+        let artifact = candidate_artifact();
+        let mut proof = complete_promotion(&artifact);
+        proof.broker_financial_truth = live_broker_truth_report(
+            binding_hash("different-portfolio"),
+            proof.gate.live_execution_contract.risk_config_hash.clone(),
+        );
+        let error = artifact
+            .with_validated_promotion(proof)
+            .expect_err("broker truth must bind the exact portfolio");
+        assert!(error.to_string().contains("does not bind this portfolio"));
+    }
+
+    #[test]
+    fn broker_truth_for_another_risk_config_cannot_promote() {
+        let artifact = candidate_artifact();
+        let mut proof = complete_promotion(&artifact);
+        proof.broker_financial_truth = live_broker_truth_report(
+            artifact.subject_hash().unwrap(),
+            binding_hash("different-risk-config"),
+        );
+        let error = artifact
+            .with_validated_promotion(proof)
+            .expect_err("broker truth must bind the live risk configuration");
+        assert!(
+            error
+                .to_string()
+                .contains("does not bind live risk configuration")
+        );
+    }
+
+    #[test]
+    fn promoted_artifact_rejects_replaced_financial_truth() {
+        let candidate = candidate_artifact();
+        let proof = complete_promotion(&candidate);
+        let mut promoted = candidate.with_validated_promotion(proof).unwrap();
+        promoted.broker_financial_truth =
+            BrokerFinancialTruthReport::mechanical("tampered after promotion");
+        assert!(promoted.require_live_promotion_ready().is_err());
     }
 
     #[test]

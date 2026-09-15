@@ -5560,6 +5560,9 @@ pub fn save_promotion_summary_json(path: impl AsRef<Path>, result: &DiscoveryRes
         producer_side_complete: bool,
         check_summary: Vec<(&'static str, &'static str)>,
         determinism_policy: neoethos_core::contracts::DeterminismPolicy,
+        broker_financial_truth_mode: neoethos_core::FinancialTruthMode,
+        broker_financial_truth_ready: bool,
+        broker_financial_truth_diagnostic: &'static str,
         /// Held-out out-of-sample verdict — the single most decision-relevant
         /// promotion signal. Surfaced here (per-portfolio) so operators AND the
         /// model-training corpus can weight each strategy by its honest OOS
@@ -5585,6 +5588,10 @@ pub fn save_promotion_summary_json(path: impl AsRef<Path>, result: &DiscoveryRes
         validation_evidence_missing_kinds: hashes.missing_kinds(),
         validation_evidence_hashes: &hashes,
         determinism_policy: crate::genetic::current_determinism_policy(),
+        broker_financial_truth_mode: neoethos_core::FinancialTruthMode::Mechanical,
+        broker_financial_truth_ready: false,
+        broker_financial_truth_diagnostic:
+            neoethos_core::BROKER_FINANCIAL_TRUTH_UNAVAILABLE_V1,
         out_of_sample: OutOfSampleVerdict {
             forward_test_passed: evidence.forward_test_passed,
             prop_firm_passed: evidence.prop_firm_passed,

@@ -1,4 +1,5 @@
 pub mod broker_config;
+pub mod broker_financial_truth;
 pub mod config;
 pub mod contracts;
 pub mod domain;
@@ -24,6 +25,7 @@ pub use broker_config::{
     load_from_disk as load_broker_credentials_from_disk,
     save_to_disk as save_broker_credentials_to_disk,
 };
+pub use broker_financial_truth::*;
 pub use config::{default_news_rss_feeds, NewsTradingMode, Settings};
 pub use contracts::{
     ARTIFACT_SCHEMA_VERSION, ArtifactContractError, ArtifactContractKind, ArtifactEnvelope,
