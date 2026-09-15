@@ -2,16 +2,18 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 use neoethos_core::{
-    BrokerCloseDeal, BrokerPositionFinancialRow, BrokerPositionFinancialSnapshot,
-    CloseDealReconciliation, CommissionTypeExact, EvidenceProvenance, ExactCommissionSchedule,
-    ExactHolidayWindow, ExactProtoOaSymbolContract, ExactSwapSchedule, ExactTradingInterval,
-    ExpectedLocalClose, HistoricalBrokerTruthEvidence, MinimumCommissionCurrency,
-    PositionDirection, SwapCalculationExact, SynchronizedBidAsk, SynchronizedConversionLeg,
-    SynchronizedQuote, reconcile_close_deals,
+    BrokerCloseDeal, BrokerFinancialTruthReport, BrokerPositionFinancialRow,
+    BrokerPositionFinancialSnapshot, CloseDealReconciliation, CommissionTypeExact, ConversionBook,
+    EvidenceProvenance, ExactCommissionSchedule, ExactHolidayWindow, ExactProtoOaSymbolContract,
+    ExactSwapSchedule, ExactTradingInterval, ExpectedLocalClose, HistoricalBrokerTruthEvidence,
+    LiveBrokerTruthEvidence, MinimumCommissionCurrency, PositionDirection, ReconciliationState,
+    SwapCalculationExact, SynchronizedBidAsk, SynchronizedConversionLeg, SynchronizedQuote,
+    reconcile_close_deals,
 };
 
 use super::ctrader_account::{
-    CTraderDealSnapshot, CTraderReconcileSnapshot, CTraderTraderSnapshot,
+    CTraderAccountRuntimeRaw, CTraderAccountRuntimeRequest, CTraderDealSnapshot,
+    CTraderReconcileSnapshot, CTraderTraderSnapshot, load_account_runtime_raw_with_transport,
     parse_deal_list_by_position_id_response, parse_deal_list_response, parse_reconcile_response,
     parse_trader_response,
 };
@@ -21,8 +23,279 @@ use super::ctrader_data::{
     parse_asset_list_response, parse_symbol_by_id_response, parse_symbols_list_response,
     parse_tick_data_response,
 };
-use super::ctrader_messages::parse_get_position_unrealized_pnl_response;
-use super::pnl::AuthoritativeUnrealizedPnL;
+use super::ctrader_history::{
+    CTraderQuoteSide, CTraderTickDataRaw, CTraderTickDataRequest,
+    fetch_tick_data_raw_with_transport,
+};
+use super::ctrader_messages::{
+    CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE, CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE,
+    CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE, CTraderOpenApiTransport,
+    ProductionCTraderOpenApiTransport, build_account_auth_request, build_application_auth_request,
+    build_asset_list_request, parse_ctrader_error_payload,
+    parse_get_position_unrealized_pnl_response, parse_open_api_envelope,
+};
+use super::pnl::{
+    AuthoritativeUnrealizedPnL, AuthoritativeUnrealizedPnLRaw,
+};
+
+#[derive(Clone, PartialEq)]
+pub struct CTraderHistoricalTruthRequest {
+    pub client_id: String,
+    pub client_secret: String,
+    pub access_token: String,
+    pub environment: super::ctrader_live_auth::CTraderEnvironment,
+    pub account_id: String,
+    pub symbol_name: String,
+    pub conversion_symbols: Vec<String>,
+    pub from_timestamp_ms: i64,
+    pub to_timestamp_ms: i64,
+    pub initial_equity: f64,
+    pub risk_config_hash: String,
+    pub strategy_hash: String,
+    pub slippage_policy_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProducedHistoricalBrokerTruth {
+    pub evidence: HistoricalBrokerTruthEvidence,
+    pub report: BrokerFinancialTruthReport,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerFinancialTruthState {
+    report: BrokerFinancialTruthReport,
+    historical: Option<HistoricalBrokerTruthEvidence>,
+    positions: Option<BrokerPositionFinancialSnapshot>,
+    close_reconciliations: Vec<CloseDealReconciliation>,
+    pending_closes: BTreeMap<i64, ExpectedLocalClose>,
+    last_error: Option<String>,
+    revision: u64,
+    observed_account_id: Option<i64>,
+}
+
+impl Default for BrokerFinancialTruthState {
+    fn default() -> Self {
+        Self {
+            report: BrokerFinancialTruthReport::mechanical("broker_truth_not_initialized"),
+            historical: None,
+            positions: None,
+            close_reconciliations: Vec::new(),
+            pending_closes: BTreeMap::new(),
+            last_error: None,
+            revision: 0,
+            observed_account_id: None,
+        }
+    }
+}
+
+impl BrokerFinancialTruthState {
+    pub fn report(&self) -> &BrokerFinancialTruthReport {
+        &self.report
+    }
+
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
+    }
+
+    pub fn install_historical(&mut self, evidence: HistoricalBrokerTruthEvidence) -> Result<()> {
+        if self
+            .observed_account_id
+            .is_some_and(|account_id| account_id != evidence.symbol_contract.account_id)
+        {
+            bail!("historical broker truth belongs to another observed account");
+        }
+        let report =
+            BrokerFinancialTruthReport::historical(&evidence).map_err(anyhow::Error::new)?;
+        self.observed_account_id = Some(evidence.symbol_contract.account_id);
+        self.historical = Some(evidence);
+        self.positions = None;
+        self.close_reconciliations.clear();
+        self.pending_closes.clear();
+        self.report = report;
+        self.last_error = None;
+        Ok(())
+    }
+
+    pub fn begin_historical_refresh(&mut self) -> u64 {
+        self.revision = self.revision.wrapping_add(1);
+        self.report = BrokerFinancialTruthReport::mechanical(
+            "historical broker truth refresh in progress",
+        );
+        self.historical = None;
+        self.positions = None;
+        self.close_reconciliations.clear();
+        self.pending_closes.clear();
+        self.last_error = Some("historical broker truth refresh in progress".to_string());
+        self.revision
+    }
+
+    pub fn install_historical_at_revision(
+        &mut self,
+        expected_revision: u64,
+        evidence: HistoricalBrokerTruthEvidence,
+    ) -> Result<()> {
+        if self.revision != expected_revision {
+            bail!("broker identity changed while historical truth was being refreshed");
+        }
+        self.install_historical(evidence)
+    }
+
+    pub fn reject_historical_refresh(
+        &mut self,
+        expected_revision: u64,
+        reason: impl Into<String>,
+    ) {
+        if self.revision == expected_revision {
+            self.invalidate(reason);
+        }
+    }
+
+    pub fn invalidate(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.revision = self.revision.wrapping_add(1);
+        self.report = BrokerFinancialTruthReport::mechanical(reason.clone());
+        self.historical = None;
+        self.positions = None;
+        self.close_reconciliations.clear();
+        self.pending_closes.clear();
+        self.last_error = Some(reason);
+        self.observed_account_id = None;
+    }
+
+    pub fn clear_live(&mut self, reason: impl Into<String>) {
+        self.positions = None;
+        let reason = reason.into();
+        self.report = self
+            .historical
+            .as_ref()
+            .and_then(|evidence| BrokerFinancialTruthReport::historical(evidence).ok())
+            .unwrap_or_else(|| BrokerFinancialTruthReport::mechanical(reason.clone()));
+        self.last_error = Some(reason);
+    }
+
+    pub fn observe_account(&mut self, account_id: i64) {
+        if self.observed_account_id.is_some_and(|current| current != account_id) {
+            let previous = self.observed_account_id.unwrap_or_default();
+            self.invalidate(format!(
+                "broker account changed from {} to {account_id}",
+                previous
+            ));
+        }
+        self.observed_account_id = Some(account_id);
+    }
+
+    pub fn record_expected_close(&mut self, position_id: i64, wire_volume: i64) -> Result<()> {
+        let historical = self
+            .historical
+            .as_ref()
+            .context("historical broker truth is not ready")?;
+        let positions = self
+            .positions
+            .as_ref()
+            .context("authoritative broker position snapshot is not ready")?;
+        let position = positions
+            .positions
+            .iter()
+            .find(|position| position.position_id == position_id)
+            .context("position is absent from authoritative broker snapshot")?;
+        let expected_volume_units = wire_volume as f64 / 100.0;
+        if position.symbol_id != historical.symbol_contract.symbol_id
+            || wire_volume <= 0
+            || expected_volume_units > position.volume_units
+        {
+            bail!("close request does not match current broker-truth subject");
+        }
+        self.pending_closes.insert(
+            position_id,
+            ExpectedLocalClose {
+                account_id: positions.account_id,
+                symbol_id: position.symbol_id,
+                position_id,
+                direction: position.direction,
+                expected_volume_units,
+                local_estimated_pnl_account: None,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn discard_expected_close(&mut self, position_id: i64) {
+        self.pending_closes.remove(&position_id);
+    }
+
+    pub fn ingest_live_snapshot(
+        &mut self,
+        account: &CTraderAccountRuntimeRaw,
+        pnl: &AuthoritativeUnrealizedPnLRaw,
+        captured_at_ms: i64,
+        max_age_ms: i64,
+    ) -> Result<()> {
+        self.observe_account(account.snapshot.trader.account_id);
+        let historical = self
+            .historical
+            .as_ref()
+            .context("historical broker truth is not ready")?;
+        self.positions = None;
+        self.report =
+            BrokerFinancialTruthReport::historical(historical).map_err(anyhow::Error::new)?;
+        let positions = broker_position_financial_snapshot(
+            &account.snapshot.reconcile,
+            &pnl.snapshot,
+            std::slice::from_ref(&historical.symbol_contract),
+            &historical.symbol_contract.account_currency,
+            &account.reconcile_response_json,
+            &pnl.response_json,
+            captured_at_ms,
+            max_age_ms,
+        )?;
+        self.positions = Some(positions);
+        for expected in self.pending_closes.values() {
+            let reconciliation = close_deal_reconciliation_from_ctrader(
+                expected.clone(),
+                &account.snapshot.recent_deals,
+                &account.deal_list_response_json,
+                captured_at_ms,
+            )?;
+            if reconciliation.state == ReconciliationState::Reconciled {
+                self.close_reconciliations
+                    .retain(|old| old.expected.position_id != expected.position_id);
+                self.close_reconciliations.push(reconciliation);
+            }
+        }
+        let reconciled_ids = self
+            .close_reconciliations
+            .iter()
+            .map(|value| value.expected.position_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        self.pending_closes
+            .retain(|position_id, _| !reconciled_ids.contains(position_id));
+        self.refresh_report()
+    }
+
+    fn refresh_report(&mut self) -> Result<()> {
+        let historical = self
+            .historical
+            .as_ref()
+            .context("historical broker truth is not ready")?;
+        if let Some(positions) = self.positions.clone()
+            && !self.close_reconciliations.is_empty()
+        {
+            let live = LiveBrokerTruthEvidence::new(
+                historical.clone(),
+                positions,
+                self.close_reconciliations.clone(),
+            )
+            .map_err(anyhow::Error::new)?;
+            self.report = BrokerFinancialTruthReport::live(&live).map_err(anyhow::Error::new)?;
+        } else {
+            self.report =
+                BrokerFinancialTruthReport::historical(historical).map_err(anyhow::Error::new)?;
+        }
+        self.last_error = None;
+        Ok(())
+    }
+}
 
 pub fn source_payload_hash(payloads: &[&str]) -> String {
     let mut bytes = Vec::new();
@@ -31,6 +304,185 @@ pub fn source_payload_hash(payloads: &[&str]) -> String {
         bytes.extend_from_slice(payload.as_bytes());
     }
     format!("fnv64:{:016x}", neoethos_core::utils::fnv1a64(&bytes))
+}
+
+pub fn produce_historical_broker_truth(
+    request: &CTraderHistoricalTruthRequest,
+) -> Result<ProducedHistoricalBrokerTruth> {
+    let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
+    produce_historical_broker_truth_with_transport(&transport, request)
+}
+
+pub fn produce_historical_broker_truth_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderHistoricalTruthRequest,
+) -> Result<ProducedHistoricalBrokerTruth> {
+    if request.from_timestamp_ms > request.to_timestamp_ms {
+        bail!("invalid broker-truth tick window");
+    }
+    let account = load_account_runtime_raw_with_transport(
+        transport,
+        &CTraderAccountRuntimeRequest {
+            client_id: request.client_id.clone(),
+            client_secret: request.client_secret.clone(),
+            access_token: request.access_token.clone(),
+            environment: request.environment,
+            account_id: request.account_id.clone(),
+            return_protection_orders: false,
+        },
+    )?;
+    let (assets, assets_raw) = fetch_assets_raw(transport, request)?;
+    let captured_at_ms = chrono::Utc::now().timestamp_millis();
+    let (contract, bid_ask) = fetch_contract_and_quotes(
+        transport,
+        request,
+        &request.symbol_name,
+        &assets,
+        &assets_raw,
+        &account,
+        captured_at_ms,
+    )?;
+
+    let mut conversion_symbols = request
+        .conversion_symbols
+        .iter()
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect::<Vec<_>>();
+    conversion_symbols.sort();
+    conversion_symbols.dedup();
+    let mut conversion_legs = Vec::with_capacity(conversion_symbols.len());
+    for symbol in conversion_symbols {
+        let (conversion_contract, quotes) = fetch_contract_and_quotes(
+            transport,
+            request,
+            &symbol,
+            &assets,
+            &assets_raw,
+            &account,
+            captured_at_ms,
+        )?;
+        conversion_legs.push(synchronized_conversion_leg(&conversion_contract, quotes)?);
+    }
+    let conversions = ConversionBook::new(contract.account_currency.clone(), conversion_legs)
+        .map_err(anyhow::Error::new)?;
+    let evidence = historical_truth_from_ctrader(
+        contract,
+        bid_ask,
+        conversions,
+        request.initial_equity,
+        &request.risk_config_hash,
+        &request.strategy_hash,
+        &request.slippage_policy_hash,
+    )?;
+    let report = BrokerFinancialTruthReport::historical(&evidence).map_err(anyhow::Error::new)?;
+    Ok(ProducedHistoricalBrokerTruth { evidence, report })
+}
+
+fn fetch_assets_raw<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderHistoricalTruthRequest,
+) -> Result<(Vec<CTraderAssetInfo>, String)> {
+    let account_id = request
+        .account_id
+        .parse::<i64>()
+        .context("cTrader account id must be numeric")?;
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(
+            &request.client_id,
+            &request.client_secret,
+            "truth-assets-app",
+        ),
+        build_account_auth_request(account_id, &request.access_token, "truth-assets-account"),
+        build_asset_list_request(account_id, "truth-assets"),
+    ])?;
+    ensure_payload(
+        &responses,
+        0,
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_payload(&responses, 1, CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_payload(&responses, 2, CTRADER_OA_ASSET_LIST_RESPONSE_PAYLOAD_TYPE)?;
+    let raw = responses[2].clone();
+    Ok((parse_asset_list_response(&raw)?, raw))
+}
+
+fn fetch_contract_and_quotes<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderHistoricalTruthRequest,
+    symbol_name: &str,
+    assets: &[CTraderAssetInfo],
+    assets_raw: &str,
+    account: &CTraderAccountRuntimeRaw,
+    captured_at_ms: i64,
+) -> Result<(ExactProtoOaSymbolContract, SynchronizedBidAsk)> {
+    let bid = fetch_truth_ticks(transport, request, symbol_name, CTraderQuoteSide::Bid)?;
+    let ask = fetch_truth_ticks(transport, request, symbol_name, CTraderQuoteSide::Ask)?;
+    if bid.resolved.resolved != ask.resolved.resolved {
+        bail!("BID and ASK resolved different ProtoOA symbol contracts");
+    }
+    let contract = exact_symbol_contract_from_proto_oa(
+        &bid.resolved.resolved,
+        assets,
+        &account.snapshot.trader,
+        &bid.resolved.symbol_response_json,
+        &bid.resolved.symbols_response_json,
+        assets_raw,
+        &account.trader_response_json,
+        captured_at_ms,
+    )?;
+    let quotes = synchronize_historical_bid_ask(
+        &contract,
+        &bid.resolved.resolved.symbol,
+        &bid.ticks,
+        &ask.ticks,
+        &bid.response_json,
+        &ask.response_json,
+        captured_at_ms,
+    )?;
+    Ok((contract, quotes))
+}
+
+fn fetch_truth_ticks<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderHistoricalTruthRequest,
+    symbol_name: &str,
+    quote_side: CTraderQuoteSide,
+) -> Result<CTraderTickDataRaw> {
+    fetch_tick_data_raw_with_transport(
+        transport,
+        &CTraderTickDataRequest {
+            client_id: request.client_id.clone(),
+            client_secret: request.client_secret.clone(),
+            access_token: request.access_token.clone(),
+            environment: request.environment,
+            account_id: request.account_id.clone(),
+            symbol_name: symbol_name.to_string(),
+            quote_side,
+            from_timestamp_ms: request.from_timestamp_ms,
+            to_timestamp_ms: request.to_timestamp_ms,
+        },
+    )
+}
+
+fn ensure_payload(responses: &[String], index: usize, expected: u32) -> Result<()> {
+    let response = responses
+        .get(index)
+        .with_context(|| format!("missing cTrader response at step {index}"))?;
+    let envelope = parse_open_api_envelope(response)?;
+    if envelope.payload_type == CTRADER_OA_ERROR_RESPONSE_PAYLOAD_TYPE {
+        bail!(
+            "cTrader financial-truth request failed: {}",
+            parse_ctrader_error_payload(&envelope.payload)?
+        );
+    }
+    if envelope.payload_type != expected {
+        bail!(
+            "unexpected cTrader financial-truth payload type: expected {expected}, got {}",
+            envelope.payload_type
+        );
+    }
+    Ok(())
 }
 
 pub fn exact_symbol_contract_from_proto_oa(
@@ -70,7 +522,10 @@ pub fn exact_symbol_contract_from_proto_oa(
         .into_iter()
         .find(|candidate| candidate.symbol_id == symbol.symbol_id)
         .context("raw ProtoOA response does not contain resolved symbol")?;
-    if raw_symbol != *symbol {
+    let mut resolved_wire_projection = symbol.clone();
+    resolved_wire_projection.symbol_name = raw_symbol.symbol_name.clone();
+    resolved_wire_projection.display_name = raw_symbol.display_name.clone();
+    if raw_symbol != resolved_wire_projection {
         bail!("resolved symbol differs from raw ProtoOA response");
     }
     if light.symbol_id != symbol.symbol_id
@@ -517,8 +972,45 @@ mod tests {
         CTraderPendingOrderSnapshot, CTraderPositionSnapshot,
     };
     use crate::app_services::ctrader_data::CTraderLightSymbolInfo;
+    use crate::app_services::ctrader_messages::CTraderOpenApiJsonMessage;
     use crate::app_services::pnl::BrokerPositionPnL;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+
+    struct BatchTransport {
+        batches: Mutex<VecDeque<Vec<String>>>,
+    }
+
+    impl BatchTransport {
+        fn new(batches: Vec<Vec<String>>) -> Self {
+            Self {
+                batches: Mutex::new(batches.into()),
+            }
+        }
+    }
+
+    impl CTraderOpenApiTransport for BatchTransport {
+        fn send_sequence(&self, messages: &[CTraderOpenApiJsonMessage]) -> Result<Vec<String>> {
+            let batch = self
+                .batches
+                .lock()
+                .unwrap()
+                .pop_front()
+                .context("fixture transport exhausted")?;
+            if batch.len() != messages.len() {
+                bail!(
+                    "fixture batch has {} responses for {} requests",
+                    batch.len(),
+                    messages.len()
+                );
+            }
+            Ok(batch)
+        }
+    }
+
+    fn ok(payload_type: u32) -> String {
+        serde_json::json!({"payloadType": payload_type, "payload": {}}).to_string()
+    }
 
     fn fixture_resolved() -> CTraderResolvedSymbol {
         let raw = include_str!("../../tests/fixtures/ctrader_symbol_EURUSD.raw.json");
@@ -583,6 +1075,107 @@ mod tests {
         })
         .to_string();
         (parse_trader_response(&raw).unwrap(), raw)
+    }
+
+    fn empty_reconcile_raw() -> String {
+        serde_json::json!({
+            "payloadType": 2125,
+            "payload": {"ctidTraderAccountId": 47_367_144, "position": [], "order": []}
+        })
+        .to_string()
+    }
+
+    fn empty_deals_raw() -> String {
+        serde_json::json!({"payloadType": 2134, "payload": {"deal": []}}).to_string()
+    }
+
+    fn historical_request() -> CTraderHistoricalTruthRequest {
+        CTraderHistoricalTruthRequest {
+            client_id: "client".to_string(),
+            client_secret: "secret".to_string(),
+            access_token: "token".to_string(),
+            environment: super::super::ctrader_live_auth::CTraderEnvironment::Demo,
+            account_id: "47367144".to_string(),
+            symbol_name: "EURUSD".to_string(),
+            conversion_symbols: Vec::new(),
+            from_timestamp_ms: 1_000,
+            to_timestamp_ms: 2_000,
+            initial_equity: 10_000.0,
+            risk_config_hash: source_payload_hash(&["risk"]),
+            strategy_hash: source_payload_hash(&["strategy"]),
+            slippage_policy_hash: source_payload_hash(&["slippage"]),
+        }
+    }
+
+    fn side_batches(ticks: HistoricalTicksResult) -> Vec<Vec<String>> {
+        vec![
+            vec![ok(2101), ok(2103), fixture_symbols_raw()],
+            vec![
+                ok(2101),
+                ok(2103),
+                include_str!("../../tests/fixtures/ctrader_symbol_EURUSD.raw.json").to_string(),
+            ],
+            vec![ok(2101), ok(2103), tick_response(&ticks)],
+        ]
+    }
+
+    fn historical_batches(ask_ticks: HistoricalTicksResult) -> Vec<Vec<String>> {
+        let (_, trader_raw) = fixture_trader();
+        let (_, assets_raw) = fixture_assets();
+        let bid = HistoricalTicksResult {
+            symbol_id: 1,
+            ticks: vec![
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 1_000,
+                    price: 1.1,
+                },
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 2_000,
+                    price: 1.2,
+                },
+            ],
+            has_more: false,
+        };
+        let mut batches = vec![
+            vec![
+                ok(2101),
+                ok(2103),
+                trader_raw,
+                empty_reconcile_raw(),
+                empty_deals_raw(),
+            ],
+            vec![ok(2101), ok(2103), assets_raw],
+        ];
+        batches.extend(side_batches(bid));
+        batches.extend(side_batches(ask_ticks));
+        batches
+    }
+
+    fn installed_historical() -> HistoricalBrokerTruthEvidence {
+        let contract = fixture_contract();
+        let quotes = SynchronizedBidAsk::new(
+            1,
+            "EURUSD",
+            vec![SynchronizedQuote {
+                timestamp_ms: 1_000,
+                bid: 1.1,
+                ask: 1.1002,
+            }],
+            source_payload_hash(&["bid"]),
+            source_payload_hash(&["ask"]),
+            EvidenceProvenance::new("fixture", 1_000, source_payload_hash(&["quotes"])).unwrap(),
+        )
+        .unwrap();
+        HistoricalBrokerTruthEvidence::new(
+            contract,
+            quotes,
+            ConversionBook::new("USD", vec![]).unwrap(),
+            10_000.0,
+            source_payload_hash(&["risk"]),
+            source_payload_hash(&["strategy"]),
+            source_payload_hash(&["slippage"]),
+        )
+        .unwrap()
     }
 
     fn fixture_contract() -> ExactProtoOaSymbolContract {
@@ -989,5 +1582,293 @@ mod tests {
             neoethos_core::ReconciliationState::Reconciled
         );
         assert_eq!(complete.broker_net_profit_account, Some(12.4));
+    }
+
+    #[test]
+    fn production_orchestration_builds_historical_truth_from_raw_bid_and_ask() {
+        let ask = HistoricalTicksResult {
+            symbol_id: 1,
+            ticks: vec![
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 1_000,
+                    price: 1.1002,
+                },
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 2_000,
+                    price: 1.2002,
+                },
+            ],
+            has_more: false,
+        };
+        let transport = BatchTransport::new(historical_batches(ask));
+        let produced =
+            produce_historical_broker_truth_with_transport(&transport, &historical_request())
+                .unwrap();
+        assert!(produced.report.broker_historical_ready);
+        assert!(!produced.report.live_broker_ready);
+        assert_eq!(produced.evidence.bid_ask.quotes.len(), 2);
+        assert!(produced.evidence.conversions.legs.is_empty());
+    }
+
+    #[test]
+    fn production_orchestration_missing_ask_fails_closed() {
+        let ask = HistoricalTicksResult {
+            symbol_id: 1,
+            ticks: Vec::new(),
+            has_more: false,
+        };
+        let transport = BatchTransport::new(historical_batches(ask));
+        assert!(
+            produce_historical_broker_truth_with_transport(&transport, &historical_request())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn production_orchestration_required_conversion_missing_fails_closed() {
+        let ask = HistoricalTicksResult {
+            symbol_id: 1,
+            ticks: vec![
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 1_000,
+                    price: 1.1002,
+                },
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 2_000,
+                    price: 1.2002,
+                },
+            ],
+            has_more: false,
+        };
+        let mut batches = historical_batches(ask);
+        let mut trader: serde_json::Value = serde_json::from_str(&batches[0][2]).unwrap();
+        trader["payload"]["trader"]["depositAssetId"] = serde_json::json!(4);
+        batches[0][2] = trader.to_string();
+        let transport = BatchTransport::new(batches);
+        assert!(
+            produce_historical_broker_truth_with_transport(&transport, &historical_request())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn production_orchestration_uses_explicit_synchronized_conversion_leg() {
+        let bid = HistoricalTicksResult {
+            symbol_id: 1,
+            ticks: vec![
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 1_000,
+                    price: 1.1,
+                },
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 2_000,
+                    price: 1.2,
+                },
+            ],
+            has_more: false,
+        };
+        let ask = HistoricalTicksResult {
+            symbol_id: 1,
+            ticks: vec![
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 1_000,
+                    price: 1.1002,
+                },
+                super::super::ctrader_data::HistoricalTick {
+                    timestamp_ms: 2_000,
+                    price: 1.2002,
+                },
+            ],
+            has_more: false,
+        };
+        let mut batches = historical_batches(ask.clone());
+        let mut trader: serde_json::Value = serde_json::from_str(&batches[0][2]).unwrap();
+        trader["payload"]["trader"]["depositAssetId"] = serde_json::json!(4);
+        batches[0][2] = trader.to_string();
+        batches.extend(side_batches(bid));
+        batches.extend(side_batches(ask));
+        let transport = BatchTransport::new(batches);
+        let mut request = historical_request();
+        request.conversion_symbols = vec!["EURUSD".to_string()];
+        let produced =
+            produce_historical_broker_truth_with_transport(&transport, &request).unwrap();
+        assert!(produced.report.broker_historical_ready);
+        assert_eq!(produced.evidence.conversions.account_currency, "EUR");
+        assert_eq!(produced.evidence.conversions.legs.len(), 1);
+    }
+
+    #[test]
+    fn truth_state_invalidates_on_account_change_and_needs_close_for_live() {
+        let mut state = BrokerFinancialTruthState::default();
+        state.install_historical(installed_historical()).unwrap();
+        assert!(state.report().broker_historical_ready);
+        assert!(!state.report().live_broker_ready);
+        state.observe_account(99);
+        assert!(!state.report().broker_historical_ready);
+    }
+
+    #[test]
+    fn stale_historical_refresh_cannot_reinstall_truth_after_invalidation() {
+        let mut state = BrokerFinancialTruthState::default();
+        let revision = state.begin_historical_refresh();
+        state.invalidate("active broker account changed");
+        assert!(
+            state
+                .install_historical_at_revision(revision, installed_historical())
+                .is_err()
+        );
+        assert!(!state.report().broker_historical_ready);
+    }
+
+    #[test]
+    fn stale_historical_refresh_failure_cannot_invalidate_newer_truth() {
+        let mut state = BrokerFinancialTruthState::default();
+        let stale_revision = state.begin_historical_refresh();
+        let current_revision = state.begin_historical_refresh();
+        state
+            .install_historical_at_revision(current_revision, installed_historical())
+            .unwrap();
+        state.reject_historical_refresh(stale_revision, "stale request failed");
+        assert!(state.report().broker_historical_ready);
+    }
+
+    #[test]
+    fn account_change_during_refresh_blocks_stale_evidence_installation() {
+        let mut state = BrokerFinancialTruthState::default();
+        state.observe_account(47_367_144);
+        let revision = state.begin_historical_refresh();
+        state.observe_account(99);
+        assert!(
+            state
+                .install_historical_at_revision(revision, installed_historical())
+                .is_err()
+        );
+        assert!(!state.report().broker_historical_ready);
+    }
+
+    #[test]
+    fn authoritative_pnl_and_broker_close_make_live_truth_ready() {
+        let position_raw = serde_json::json!({
+            "payloadType": 2125,
+            "payload": {
+                "ctidTraderAccountId": 47_367_144,
+                "position": [{
+                    "positionId": 9,
+                    "tradeData": {
+                        "symbolId": 1,
+                        "volume": 100_000,
+                        "tradeSide": 1,
+                        "openTimestamp": 1_000
+                    },
+                    "price": 1.1,
+                    "swap": -20,
+                    "commission": -40,
+                    "moneyDigits": 2
+                }],
+                "order": []
+            }
+        })
+        .to_string();
+        let pnl_raw = serde_json::json!({
+            "payloadType": 2188,
+            "payload": {
+                "ctidTraderAccountId": 47_367_144,
+                "moneyDigits": 2,
+                "positionUnrealizedPnL": [{
+                    "positionId": 9,
+                    "grossUnrealizedPnL": 1_200,
+                    "netUnrealizedPnL": 1_140
+                }]
+            }
+        })
+        .to_string();
+        let (_, trader_raw) = fixture_trader();
+        let account = CTraderAccountRuntimeRaw {
+            snapshot: super::super::ctrader_account::CTraderAccountRuntimeSnapshot {
+                trader: parse_trader_response(&trader_raw).unwrap(),
+                reconcile: parse_reconcile_response(&position_raw).unwrap(),
+                recent_deals: Vec::new(),
+            },
+            trader_response_json: trader_raw.clone(),
+            reconcile_response_json: position_raw,
+            deal_list_response_json: empty_deals_raw(),
+        };
+        let pnl = AuthoritativeUnrealizedPnLRaw {
+            snapshot: AuthoritativeUnrealizedPnL {
+                account_id: 47_367_144,
+                money_digits: 2,
+                by_position: HashMap::from([(
+                    9,
+                    BrokerPositionPnL {
+                        position_id: 9,
+                        gross_unrealized_pnl: 12.0,
+                        net_unrealized_pnl: 11.4,
+                        money_digits: 2,
+                    },
+                )]),
+            },
+            response_json: pnl_raw,
+        };
+        let mut state = BrokerFinancialTruthState::default();
+        state.install_historical(installed_historical()).unwrap();
+        state
+            .ingest_live_snapshot(&account, &pnl, 2_000, 30_000)
+            .unwrap();
+        assert!(!state.report().live_broker_ready);
+        state.record_expected_close(9, 100_000).unwrap();
+
+        let close = CTraderDealSnapshot {
+            deal_id: 10,
+            order_id: 11,
+            position_id: 9,
+            symbol_id: 1,
+            trade_side: "SELL".to_string(),
+            deal_status: "FILLED".to_string(),
+            volume: 1_000.0,
+            filled_volume: 1_000.0,
+            execution_timestamp_ms: 3_000,
+            execution_price: Some(1.2),
+            entry_price: Some(1.1),
+            gross_profit: Some(10.0),
+            fee: Some(-1.0),
+            swap: Some(-0.5),
+            pnl_conversion_fee: Some(-0.1),
+            net_profit: Some(8.4),
+        };
+        let deals_raw = deal_list_response(std::slice::from_ref(&close));
+        let closed_account = CTraderAccountRuntimeRaw {
+            snapshot: super::super::ctrader_account::CTraderAccountRuntimeSnapshot {
+                trader: parse_trader_response(&trader_raw).unwrap(),
+                reconcile: parse_reconcile_response(&empty_reconcile_raw()).unwrap(),
+                recent_deals: vec![close],
+            },
+            trader_response_json: trader_raw,
+            reconcile_response_json: empty_reconcile_raw(),
+            deal_list_response_json: deals_raw,
+        };
+        let empty_pnl_raw = serde_json::json!({
+            "payloadType": 2188,
+            "payload": {
+                "ctidTraderAccountId": 47_367_144,
+                "moneyDigits": 2,
+                "positionUnrealizedPnL": []
+            }
+        })
+        .to_string();
+        let empty_pnl = AuthoritativeUnrealizedPnLRaw {
+            snapshot: AuthoritativeUnrealizedPnL {
+                account_id: 47_367_144,
+                money_digits: 2,
+                by_position: HashMap::new(),
+            },
+            response_json: empty_pnl_raw,
+        };
+        state
+            .ingest_live_snapshot(&closed_account, &empty_pnl, 3_000, 30_000)
+            .unwrap();
+        assert!(state.report().live_broker_ready);
+        state.install_historical(installed_historical()).unwrap();
+        assert!(state.report().broker_historical_ready);
+        assert!(!state.report().live_broker_ready);
     }
 }

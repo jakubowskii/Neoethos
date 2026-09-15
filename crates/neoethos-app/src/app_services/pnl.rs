@@ -344,6 +344,12 @@ pub struct AuthoritativeUnrealizedPnL {
     pub by_position: HashMap<i64, BrokerPositionPnL>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthoritativeUnrealizedPnLRaw {
+    pub snapshot: AuthoritativeUnrealizedPnL,
+    pub response_json: String,
+}
+
 impl AuthoritativeUnrealizedPnL {
     /// Sum of `netUnrealizedPnL` across every position the broker
     /// returned. Account currency (deposit currency) is implicit —
@@ -421,13 +427,46 @@ pub fn fetch_unrealized_pnl_for_all_positions<T: CTraderOpenApiTransport>(
     account_id: i64,
     open_position_ids: &[i64],
 ) -> Result<AuthoritativeUnrealizedPnL> {
-    let snapshot = fetch_broker_unrealized_pnl(
+    Ok(fetch_unrealized_pnl_raw_for_all_positions(
         transport,
         client_id,
         client_secret,
         access_token,
         account_id,
+        open_position_ids,
+    )?
+    .snapshot)
+}
+
+pub fn fetch_unrealized_pnl_raw_for_all_positions<T: CTraderOpenApiTransport>(
+    transport: &T,
+    client_id: &str,
+    client_secret: &str,
+    access_token: &str,
+    account_id: i64,
+    open_position_ids: &[i64],
+) -> Result<AuthoritativeUnrealizedPnLRaw> {
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(client_id, client_secret, "pnl-app-auth-1"),
+        build_account_auth_request(account_id, access_token, "pnl-account-auth-1"),
+        build_get_position_unrealized_pnl_request(account_id, "pnl-1"),
+    ])?;
+    if responses.len() != 3 {
+        return Err(anyhow!(
+            "expected 3 cTrader unrealized pnl responses, received {}",
+            responses.len()
+        ));
+    }
+    ensure_success(
+        &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
     )?;
+    ensure_success(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success(
+        &responses[2],
+        CTRADER_OA_GET_POSITION_UNREALIZED_PNL_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    let snapshot = parse_get_position_unrealized_pnl_response(&responses[2])?;
 
     let mut by_position: HashMap<i64, BrokerPositionPnL> =
         HashMap::with_capacity(snapshot.positions.len());
@@ -471,10 +510,14 @@ pub fn fetch_unrealized_pnl_for_all_positions<T: CTraderOpenApiTransport>(
         }
     }
 
-    Ok(AuthoritativeUnrealizedPnL {
+    let snapshot = AuthoritativeUnrealizedPnL {
         account_id: snapshot.account_id,
         money_digits: snapshot.money_digits,
         by_position,
+    };
+    Ok(AuthoritativeUnrealizedPnLRaw {
+        snapshot,
+        response_json: responses[2].clone(),
     })
 }
 

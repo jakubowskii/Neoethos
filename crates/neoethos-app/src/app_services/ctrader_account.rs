@@ -137,6 +137,14 @@ pub struct CTraderAccountRuntimeSnapshot {
     pub recent_deals: Vec<CTraderDealSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderAccountRuntimeRaw {
+    pub snapshot: CTraderAccountRuntimeSnapshot,
+    pub trader_response_json: String,
+    pub reconcile_response_json: String,
+    pub deal_list_response_json: String,
+}
+
 // The account-runtime backend (trait + production impl) loads trader balance /
 // reconcile / recent-deals for the live account panel. `dead_code` because the
 // production server doesn't yet poll account runtime through this seam — the
@@ -719,6 +727,13 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderAccountRuntimeRequest,
 ) -> Result<CTraderAccountRuntimeSnapshot> {
+    Ok(load_account_runtime_raw_with_transport(transport, request)?.snapshot)
+}
+
+pub fn load_account_runtime_raw_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderAccountRuntimeRequest,
+) -> Result<CTraderAccountRuntimeRaw> {
     let account_id = request
         .account_id
         .parse::<i64>()
@@ -764,10 +779,16 @@ pub fn load_account_runtime_with_transport<T: CTraderOpenApiTransport>(
     ensure_success_payload_type(&responses[3], CTRADER_OA_RECONCILE_RESPONSE_PAYLOAD_TYPE)?;
     ensure_success_payload_type(&responses[4], CTRADER_OA_DEAL_LIST_RESPONSE_PAYLOAD_TYPE)?;
 
-    Ok(CTraderAccountRuntimeSnapshot {
+    let snapshot = CTraderAccountRuntimeSnapshot {
         trader: parse_trader_response(&responses[2])?,
         reconcile: parse_reconcile_response(&responses[3])?,
         recent_deals: parse_deal_list_response(&responses[4])?,
+    };
+    Ok(CTraderAccountRuntimeRaw {
+        snapshot,
+        trader_response_json: responses[2].clone(),
+        reconcile_response_json: responses[3].clone(),
+        deal_list_response_json: responses[4].clone(),
     })
 }
 
@@ -776,6 +797,13 @@ pub fn load_account_runtime(
 ) -> Result<CTraderAccountRuntimeSnapshot> {
     let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
     load_account_runtime_with_transport(&transport, request)
+}
+
+pub fn load_account_runtime_raw(
+    request: &CTraderAccountRuntimeRequest,
+) -> Result<CTraderAccountRuntimeRaw> {
+    let transport = ProductionCTraderOpenApiTransport::new(request.environment.endpoint_host());
+    load_account_runtime_raw_with_transport(&transport, request)
 }
 
 impl CTraderAccountRuntimeBackend for ProductionCTraderAccountRuntimeBackend {

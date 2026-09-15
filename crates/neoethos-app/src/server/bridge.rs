@@ -38,7 +38,7 @@ use crate::app_services::broker_api::fetch_broker_symbols_blocking;
 use crate::app_services::broker_config::BrokerSettingsState;
 use crate::app_services::broker_persistence::load_broker_settings;
 use crate::app_services::ctrader_account::{
-    CTraderAccountRuntimeRequest, CTraderPositionSnapshot, load_account_runtime,
+    CTraderAccountRuntimeRequest, CTraderPositionSnapshot, load_account_runtime_raw,
 };
 use crate::app_services::ctrader_auth::CTraderTokenBundle;
 use crate::app_services::ctrader_live_auth::{
@@ -47,7 +47,9 @@ use crate::app_services::ctrader_live_auth::{
 };
 use crate::app_services::ctrader_messages::ProductionCTraderOpenApiTransport;
 use crate::app_services::live_spots::get_tick;
-use crate::app_services::pnl::{BrokerPositionPnL, fetch_unrealized_pnl_for_all_positions};
+use crate::app_services::pnl::{
+    AuthoritativeUnrealizedPnLRaw, BrokerPositionPnL, fetch_unrealized_pnl_raw_for_all_positions,
+};
 use crate::app_services::secure_store::production_ctrader_token_store;
 
 use super::state::{AccountSnapshotPayload, AppApiState, PositionPayload};
@@ -329,6 +331,11 @@ async fn run(state: AppApiState) {
                 );
             }
             Err(err) => {
+                state
+                    .invalidate_broker_financial_truth(format!(
+                        "broker refresh/session failed: {err}"
+                    ))
+                    .await;
                 failures = failures.saturating_add(1);
                 tracing::warn!(
                     target: "neoethos_app::server::bridge",
@@ -528,9 +535,13 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
 
     // Step 2: the actual cTrader API call. `load_account_runtime`
     // is blocking (synchronous reqwest under the hood), so wrap it.
-    let snapshot = tokio::task::spawn_blocking(move || load_account_runtime(&request))
+    let account_raw = tokio::task::spawn_blocking(move || load_account_runtime_raw(&request))
         .await
         .map_err(|e| anyhow::anyhow!("blocking account-runtime task panicked: {e}"))??;
+    let snapshot = account_raw.snapshot.clone();
+    state
+        .observe_broker_account(snapshot.trader.account_id)
+        .await;
 
     // Reconcile the trade journal from this fresh snapshot's realized deals.
     // This is the production replacement for the retired legacy TradingSession
@@ -612,7 +623,12 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     // (the pre-#134 behaviour) and a `warn!` documents the gap so
     // the operator sees in the log that the dashboard's PnL
     // column will be quiet until the next refresh.
-    let pnl_by_position: HashMap<i64, BrokerPositionPnL> = if has_positions {
+    let historical_ready = state
+        .broker_financial_truth_report()
+        .await
+        .broker_historical_ready;
+    let mut authoritative_pnl: Option<AuthoritativeUnrealizedPnLRaw> = None;
+    let pnl_by_position: HashMap<i64, BrokerPositionPnL> = if has_positions || historical_ready {
         let open_ids: Vec<i64> = snapshot
             .reconcile
             .positions
@@ -628,6 +644,9 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         {
             Some(tb) => tb.access_token,
             None => {
+                state
+                    .clear_live_broker_financial_truth("authoritative broker PnL token unavailable")
+                    .await;
                 // #149 follow-up: this branch early-returns with pnl_usd=0.0
                 // for every open position. That used to be a `debug!` which
                 // meant the user saw quiet zeroes in the dashboard with no
@@ -677,7 +696,7 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         let account_id_i64 = snapshot.trader.account_id;
         let pnl_result = tokio::task::spawn_blocking(move || {
             let transport = ProductionCTraderOpenApiTransport::new(endpoint_host);
-            fetch_unrealized_pnl_for_all_positions(
+            fetch_unrealized_pnl_raw_for_all_positions(
                 &transport,
                 &client_id_clone,
                 &client_secret_clone,
@@ -688,8 +707,17 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
         })
         .await;
         match pnl_result {
-            Ok(Ok(auth)) => auth.by_position,
+            Ok(Ok(auth)) => {
+                let rows = auth.snapshot.by_position.clone();
+                authoritative_pnl = Some(auth);
+                rows
+            }
             Ok(Err(err)) => {
+                state
+                    .clear_live_broker_financial_truth(format!(
+                        "authoritative broker PnL unavailable: {err}"
+                    ))
+                    .await;
                 tracing::warn!(
                     target: "neoethos_app::server::bridge",
                     error = %err,
@@ -699,6 +727,11 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
                 HashMap::new()
             }
             Err(join_err) => {
+                state
+                    .clear_live_broker_financial_truth(format!(
+                        "authoritative broker PnL task failed: {join_err}"
+                    ))
+                    .await;
                 tracing::warn!(
                     target: "neoethos_app::server::bridge",
                     error = %join_err,
@@ -728,6 +761,20 @@ async fn refresh_once(state: &AppApiState) -> anyhow::Result<AccountSnapshotPayl
     // `compute_pnl_pips` for the A.3 fix) and the snapshot's
     // top-level `currency` field stays in sync.
     let account_currency = asset_id_to_currency(snapshot.trader.deposit_asset_id).to_string();
+    if let Some(pnl) = authoritative_pnl.as_ref()
+        && let Err(err) = state
+            .ingest_live_broker_truth(
+                &account_raw,
+                pnl,
+                chrono::Utc::now().timestamp_millis(),
+                30_000,
+            )
+            .await
+    {
+        state
+            .clear_live_broker_financial_truth(format!("live broker truth assembly failed: {err}"))
+            .await;
+    }
 
     // Auto-sync `system.account_currency` in config.yaml to the broker's REAL
     // deposit currency. Live sizing already reads the broker value, but the

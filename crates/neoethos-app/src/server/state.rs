@@ -230,6 +230,8 @@ pub struct AppApiState {
 #[derive(Default)]
 pub(crate) struct AppApiInner {
     pub account: Option<AccountSnapshotPayload>,
+    pub broker_financial_truth:
+        crate::app_services::broker_financial_truth::BrokerFinancialTruthState,
     pub discovery: EngineSlot,
     pub training: EngineSlot,
     /// Cached map from cTrader `symbol_id` (i64) to human-readable
@@ -416,7 +418,123 @@ impl AppApiState {
     /// the broker has since invalidated. Without this the dashboard
     /// could lie for hours after `CH_ACCESS_TOKEN_INVALID`.
     pub async fn clear_account(&self) {
-        self.inner.write().await.account = None;
+        let mut inner = self.inner.write().await;
+        inner.account = None;
+        inner
+            .broker_financial_truth
+            .invalidate("broker account/session snapshot cleared");
+    }
+
+    pub async fn broker_financial_truth_report(&self) -> neoethos_core::BrokerFinancialTruthReport {
+        self.inner
+            .read()
+            .await
+            .broker_financial_truth
+            .report()
+            .clone()
+    }
+
+    pub async fn broker_financial_truth_snapshot(
+        &self,
+    ) -> (neoethos_core::BrokerFinancialTruthReport, Option<String>) {
+        let inner = self.inner.read().await;
+        (
+            inner.broker_financial_truth.report().clone(),
+            inner
+                .broker_financial_truth
+                .last_error()
+                .map(str::to_string),
+        )
+    }
+
+    pub async fn observe_broker_account(&self, account_id: i64) {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .observe_account(account_id);
+    }
+
+    pub async fn begin_historical_broker_truth_refresh(&self) -> u64 {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .begin_historical_refresh()
+    }
+
+    pub async fn install_historical_broker_truth(
+        &self,
+        expected_revision: u64,
+        evidence: neoethos_core::HistoricalBrokerTruthEvidence,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .install_historical_at_revision(expected_revision, evidence)
+    }
+
+    pub async fn reject_historical_broker_truth_refresh(
+        &self,
+        expected_revision: u64,
+        reason: impl Into<String>,
+    ) {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .reject_historical_refresh(expected_revision, reason);
+    }
+
+    pub async fn invalidate_broker_financial_truth(&self, reason: impl Into<String>) {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .invalidate(reason);
+    }
+
+    pub async fn clear_live_broker_financial_truth(&self, reason: impl Into<String>) {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .clear_live(reason);
+    }
+
+    pub async fn ingest_live_broker_truth(
+        &self,
+        account: &crate::app_services::ctrader_account::CTraderAccountRuntimeRaw,
+        pnl: &crate::app_services::pnl::AuthoritativeUnrealizedPnLRaw,
+        captured_at_ms: i64,
+        max_age_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .ingest_live_snapshot(account, pnl, captured_at_ms, max_age_ms)
+    }
+
+    pub async fn record_expected_broker_close(
+        &self,
+        position_id: i64,
+        wire_volume: i64,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .record_expected_close(position_id, wire_volume)
+    }
+
+    pub async fn discard_expected_broker_close(&self, position_id: i64) {
+        self.inner
+            .write()
+            .await
+            .broker_financial_truth
+            .discard_expected_close(position_id);
     }
 
     // ─── Symbol catalog accessors ──────────────────────────────────────
@@ -432,7 +550,29 @@ impl AppApiState {
     /// bridge — no staleness window even if the broker re-issues
     /// symbol IDs after a maintenance window.
     pub async fn set_symbol_catalog(&self, catalog: HashMap<i64, String>) {
-        self.inner.write().await.symbol_catalog = catalog;
+        let mut inner = self.inner.write().await;
+        let bound_symbol_changed = inner
+            .broker_financial_truth
+            .report()
+            .symbol_id
+            .zip(
+                inner
+                    .broker_financial_truth
+                    .report()
+                    .symbol
+                    .as_deref(),
+            )
+            .is_some_and(|(symbol_id, symbol)| {
+                catalog
+                    .get(&symbol_id)
+                    .is_none_or(|current| !current.eq_ignore_ascii_case(symbol))
+            });
+        if bound_symbol_changed {
+            inner
+                .broker_financial_truth
+                .invalidate("broker symbol identity changed");
+        }
+        inner.symbol_catalog = catalog;
     }
 
     /// Resolve a `symbol_id` to its ticker name. `None` when the

@@ -225,6 +225,10 @@ pub fn router(state: AppApiState) -> Router {
         .route("/supervisor/tick", post(supervisor::tick))
         .route("/supervisor/chat", post(supervisor::chat))
         .route("/broker/status", get(system_status::broker_status))
+        .route(
+            "/broker/financial-truth/historical/refresh",
+            post(system_status::refresh_historical_truth),
+        )
         .route("/broker/reauth", post(broker_control::reauth))
         .route(
             "/broker/credentials",

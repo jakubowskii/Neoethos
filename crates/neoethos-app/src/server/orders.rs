@@ -293,7 +293,7 @@ pub struct ClosePositionBody {
 }
 
 pub async fn close_position(
-    State(_state): State<AppApiState>,
+    State(state): State<AppApiState>,
     Json(body): Json<ClosePositionBody>,
 ) -> Response {
     if body.position_id <= 0 || body.volume <= 0 {
@@ -307,8 +307,15 @@ pub async fn close_position(
     }
     let position_id = body.position_id;
     let volume = body.volume;
+    let recorded = state
+        .record_expected_broker_close(position_id, volume)
+        .await
+        .is_ok();
     let result =
         tokio::task::spawn_blocking(move || close_position_blocking(position_id, volume)).await;
+    if recorded && !matches!(&result, Ok(Ok(_))) {
+        state.discard_expected_broker_close(position_id).await;
+    }
     outcome_to_response(result)
 }
 

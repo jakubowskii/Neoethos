@@ -16,8 +16,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use neoethos_core::Settings;
 
+use crate::app_services::broker_financial_truth::{
+    CTraderHistoricalTruthRequest, produce_historical_broker_truth,
+};
 use crate::app_services::broker_persistence::load_broker_settings;
+use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::jobs::JobKind;
+use crate::app_services::secure_store::production_ctrader_token_store;
 
 use super::errors::{actionable_error, internal_panic};
 use super::state::AppApiState;
@@ -133,6 +138,13 @@ pub struct BrokerStatusDto {
     /// everything after the underscore prefix so the full secret
     /// never escapes the server logs / wire.
     pub client_id_prefix: String,
+    pub financial_truth_mode: neoethos_core::FinancialTruthMode,
+    pub broker_historical_ready: bool,
+    pub live_broker_ready: bool,
+    pub financial_truth_missing: Vec<String>,
+    pub financial_truth_invalid: Vec<String>,
+    pub financial_truth_hash: String,
+    pub financial_truth_error: Option<String>,
 }
 
 pub async fn broker_status(State(state): State<AppApiState>) -> Response {
@@ -170,6 +182,23 @@ pub async fn broker_status(State(state): State<AppApiState>) -> Response {
         .split_once('_')
         .map(|(prefix, _)| format!("{prefix}_…"))
         .unwrap_or_else(|| "(unset)".to_string());
+    let (truth, financial_truth_error) = state.broker_financial_truth_snapshot().await;
+    let financial_truth_missing = truth
+        .capabilities
+        .iter()
+        .filter(|capability| {
+            capability.state == neoethos_core::BrokerFinancialCapabilityState::Missing
+        })
+        .map(|capability| capability.kind.as_str().to_string())
+        .collect();
+    let financial_truth_invalid = truth
+        .capabilities
+        .iter()
+        .filter(|capability| {
+            capability.state == neoethos_core::BrokerFinancialCapabilityState::Invalid
+        })
+        .map(|capability| capability.kind.as_str().to_string())
+        .collect();
 
     Json(BrokerStatusDto {
         adapter: "cTrader".to_string(),
@@ -177,8 +206,146 @@ pub async fn broker_status(State(state): State<AppApiState>) -> Response {
         account_id,
         connected,
         client_id_prefix,
+        financial_truth_mode: truth.mode,
+        broker_historical_ready: truth.broker_historical_ready,
+        live_broker_ready: truth.live_broker_ready,
+        financial_truth_missing,
+        financial_truth_invalid,
+        financial_truth_hash: truth.truth_hash,
+        financial_truth_error,
     })
     .into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshHistoricalTruthBody {
+    pub symbol: String,
+    #[serde(default)]
+    pub conversion_symbols: Vec<String>,
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub initial_equity: f64,
+    pub risk_config_hash: String,
+    pub strategy_hash: String,
+    pub slippage_policy_hash: String,
+}
+
+pub async fn refresh_historical_truth(
+    State(state): State<AppApiState>,
+    Json(body): Json<RefreshHistoricalTruthBody>,
+) -> Response {
+    let truth_revision = state.begin_historical_broker_truth_refresh().await;
+    let broker = load_broker_settings();
+    let ctrader = broker.ctrader;
+    let Some(account_id) = ctrader
+        .accounts
+        .first()
+        .map(|account| account.account_id.clone())
+    else {
+        state
+            .reject_historical_broker_truth_refresh(
+                truth_revision,
+                "historical broker truth has no active cTrader account",
+            )
+            .await;
+        return (StatusCode::BAD_REQUEST, "no active cTrader account").into_response();
+    };
+    let token = match production_ctrader_token_store().load_token_bundle_with_legacy_fallback() {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            state
+                .reject_historical_broker_truth_refresh(
+                    truth_revision,
+                    "historical broker truth has no cTrader OAuth token",
+                )
+                .await;
+            return (StatusCode::UNAUTHORIZED, "cTrader OAuth token missing").into_response();
+        }
+        Err(error) => {
+            state
+                .reject_historical_broker_truth_refresh(
+                    truth_revision,
+                    format!("historical broker truth token unavailable: {error}"),
+                )
+                .await;
+            return actionable_error(
+                StatusCode::UNAUTHORIZED,
+                "cTrader OAuth token unavailable",
+                &error,
+            );
+        }
+    };
+    let environment = match ctrader.environment {
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Demo => {
+            CTraderEnvironment::Demo
+        }
+        crate::app_services::broker_config::CTraderBrokerEnvironment::Live => {
+            CTraderEnvironment::Live
+        }
+    };
+    let request = CTraderHistoricalTruthRequest {
+        client_id: ctrader.client_id,
+        client_secret: ctrader.client_secret,
+        access_token: token.access_token,
+        environment,
+        account_id,
+        symbol_name: body.symbol,
+        conversion_symbols: body.conversion_symbols,
+        from_timestamp_ms: body.from_ms,
+        to_timestamp_ms: body.to_ms,
+        initial_equity: body.initial_equity,
+        risk_config_hash: body.risk_config_hash,
+        strategy_hash: body.strategy_hash,
+        slippage_policy_hash: body.slippage_policy_hash,
+    };
+    let produced =
+        tokio::task::spawn_blocking(move || produce_historical_broker_truth(&request)).await;
+    match produced {
+        Ok(Ok(produced)) => {
+            match state
+                .install_historical_broker_truth(truth_revision, produced.evidence)
+                .await
+            {
+                Ok(()) => Json(produced.report).into_response(),
+                Err(error) => {
+                    state
+                        .reject_historical_broker_truth_refresh(
+                            truth_revision,
+                            format!("historical broker truth was rejected: {error}"),
+                        )
+                        .await;
+                    actionable_error(
+                        StatusCode::BAD_REQUEST,
+                        "Broker truth evidence was rejected",
+                        &error,
+                    )
+                }
+            }
+        }
+        Ok(Err(error)) => {
+            state
+                .reject_historical_broker_truth_refresh(
+                    truth_revision,
+                    format!("historical broker truth failed: {error}"),
+                )
+                .await;
+            actionable_error(
+                StatusCode::BAD_GATEWAY,
+                "Broker historical truth is incomplete",
+                &error,
+            )
+        }
+        Err(error) => {
+            state
+                .reject_historical_broker_truth_refresh(
+                    truth_revision,
+                    format!("historical broker truth task failed: {error}"),
+                )
+                .await;
+            internal_panic("Building broker historical truth", error)
+        }
+    }
 }
 
 // ─── /data/bootstrap ──────────────────────────────────────────────────────

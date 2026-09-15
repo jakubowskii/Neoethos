@@ -80,7 +80,7 @@ pub async fn credentials_get(State(_state): State<AppApiState>) -> Response {
 }
 
 pub async fn credentials_post(
-    State(_state): State<AppApiState>,
+    State(state): State<AppApiState>,
     Json(body): Json<CredentialsDto>,
 ) -> Response {
     // Trim everything before validation so a stray trailing newline
@@ -161,11 +161,16 @@ pub async fn credentials_post(
     .await;
 
     match result {
-        Ok(Ok(())) => Json(serde_json::json!({
-            "ok": true,
-            "message": "Credentials saved. Open Broker Setup → Re-authenticate to fetch a fresh token.",
-        }))
-        .into_response(),
+        Ok(Ok(())) => {
+            state
+                .invalidate_broker_financial_truth("broker credentials/environment changed")
+                .await;
+            Json(serde_json::json!({
+                "ok": true,
+                "message": "Credentials saved. Open Broker Setup → Re-authenticate to fetch a fresh token.",
+            }))
+            .into_response()
+        }
         Ok(Err(err)) => actionable_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Could not save your cTrader credentials. Make sure the app data folder \
@@ -233,7 +238,7 @@ enum SelectOutcome {
 ///   - 404 if the id is in neither the on-disk list nor the live OAuth
 ///     grant (stale UI / typo / revoked access).
 pub async fn account_select(
-    State(_state): State<AppApiState>,
+    State(state): State<AppApiState>,
     Json(body): Json<AccountSelectDto>,
 ) -> Response {
     let account_id = body.account_id.trim().to_string();
@@ -297,6 +302,9 @@ pub async fn account_select(
 
     match result {
         Ok(Ok(SelectOutcome::Promoted)) | Ok(Ok(SelectOutcome::AddedFromGrant)) => {
+            state
+                .invalidate_broker_financial_truth("active broker account changed")
+                .await;
             Json(serde_json::json!({
                 "ok": true,
                 "selectedAccountId": account_id,
@@ -326,7 +334,10 @@ pub async fn account_select(
     }
 }
 
-pub async fn reauth(State(_state): State<AppApiState>) -> Response {
+pub async fn reauth(State(state): State<AppApiState>) -> Response {
+    state
+        .invalidate_broker_financial_truth("broker OAuth session reset")
+        .await;
     // run_reauth_flow_blocking() does sync filesystem + reqwest::blocking
     // + std::net listener I/O. We MUST hop to spawn_blocking — calling
     // it directly on the tokio runtime would either panic on drop

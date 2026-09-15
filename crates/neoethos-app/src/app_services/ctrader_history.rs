@@ -43,9 +43,9 @@ use crate::app_services::ctrader_account::{
     parse_order_list_by_position_id_response, parse_symbol_category_list_response,
 };
 use crate::app_services::ctrader_data::{
-    CTraderResolvedSymbol, CTraderSymbolLookupRequest, HistoricalBar, HistoricalBarsResult,
-    HistoricalTicksResult, parse_tick_data_response, parse_trendbars_response,
-    resolve_symbol_with_transport,
+    CTraderResolvedSymbol, CTraderResolvedSymbolRaw, CTraderSymbolLookupRequest, HistoricalBar,
+    HistoricalBarsResult, HistoricalTicksResult, parse_tick_data_response,
+    parse_trendbars_response, resolve_symbol_raw_with_transport, resolve_symbol_with_transport,
 };
 use crate::app_services::ctrader_live_auth::CTraderEnvironment;
 use crate::app_services::ctrader_messages::{
@@ -394,6 +394,13 @@ pub struct CTraderTickDataRequest {
     pub to_timestamp_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CTraderTickDataRaw {
+    pub resolved: CTraderResolvedSymbolRaw,
+    pub ticks: HistoricalTicksResult,
+    pub response_json: String,
+}
+
 /// Fetch high-resolution tick data (`ProtoOAGetTickDataReq`) for a
 /// symbol. Useful for backtest precision (the trendbars-only path
 /// snaps to the smallest native period). Validates that every
@@ -402,6 +409,13 @@ pub fn fetch_tick_data_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderTickDataRequest,
 ) -> Result<HistoricalTicksResult> {
+    Ok(fetch_tick_data_raw_with_transport(transport, request)?.ticks)
+}
+
+pub fn fetch_tick_data_raw_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderTickDataRequest,
+) -> Result<CTraderTickDataRaw> {
     if request.from_timestamp_ms > request.to_timestamp_ms {
         return Err(anyhow!(
             "invalid cTrader tick window: from_ms {} > to_ms {}",
@@ -417,7 +431,7 @@ pub fn fetch_tick_data_with_transport<T: CTraderOpenApiTransport>(
         to_ms = request.to_timestamp_ms,
         "ctrader_history fetch_tick_data requesting ProtoOAGetTickDataReq"
     );
-    let resolved = resolve_symbol_with_transport(
+    let resolved = resolve_symbol_raw_with_transport(
         transport,
         &CTraderSymbolLookupRequest {
             client_id: request.client_id.clone(),
@@ -428,32 +442,49 @@ pub fn fetch_tick_data_with_transport<T: CTraderOpenApiTransport>(
             symbol_name: request.symbol_name.clone(),
         },
     )?;
-    let responses = transport.send_sequence(&[build_get_tick_data_request(
-        resolved.account_id,
-        resolved.light_symbol.symbol_id,
-        request.quote_side.as_i32(),
-        request.from_timestamp_ms,
-        request.to_timestamp_ms,
-        "history-ticks-1",
-    )])?;
-    if responses.len() != 1 {
+    let responses = transport.send_sequence(&[
+        build_application_auth_request(&request.client_id, &request.client_secret, "tick-app-auth"),
+        build_account_auth_request(
+            resolved.resolved.account_id,
+            &request.access_token,
+            "tick-account-auth",
+        ),
+        build_get_tick_data_request(
+            resolved.resolved.account_id,
+            resolved.resolved.light_symbol.symbol_id,
+            request.quote_side.as_i32(),
+            request.from_timestamp_ms,
+            request.to_timestamp_ms,
+            "history-ticks-1",
+        ),
+    ])?;
+    if responses.len() != 3 {
         return Err(anyhow!(
-            "expected 1 cTrader tick-data response, received {}",
+            "expected 3 cTrader tick-data auth/data responses, received {}",
             responses.len()
         ));
     }
     ensure_success_payload_type(
         &responses[0],
+        CTRADER_OA_APPLICATION_AUTH_RESPONSE_PAYLOAD_TYPE,
+    )?;
+    ensure_success_payload_type(&responses[1], CTRADER_OA_ACCOUNT_AUTH_RESPONSE_PAYLOAD_TYPE)?;
+    ensure_success_payload_type(
+        &responses[2],
         CTRADER_OA_GET_TICK_DATA_RESPONSE_PAYLOAD_TYPE,
     )?;
-    let result = parse_tick_data_response(&responses[0], &resolved.symbol)?;
+    let result = parse_tick_data_response(&responses[2], &resolved.resolved.symbol)?;
     validate_tick_window(
         &result,
         request.from_timestamp_ms,
         request.to_timestamp_ms,
         &request.symbol_name,
     );
-    Ok(result)
+    Ok(CTraderTickDataRaw {
+        resolved,
+        ticks: result,
+        response_json: responses[2].clone(),
+    })
 }
 
 /// Production wrapper for [`fetch_tick_data_with_transport`].

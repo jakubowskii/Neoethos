@@ -466,6 +466,13 @@ pub struct CTraderResolvedSymbol {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct CTraderResolvedSymbolRaw {
+    pub resolved: CTraderResolvedSymbol,
+    pub symbols_response_json: String,
+    pub symbol_response_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct HistoricalBar {
     pub timestamp_ms: i64,
     pub open: f64,
@@ -1348,6 +1355,13 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
     transport: &T,
     request: &CTraderSymbolLookupRequest,
 ) -> Result<CTraderResolvedSymbol> {
+    Ok(resolve_symbol_raw_with_transport(transport, request)?.resolved)
+}
+
+pub fn resolve_symbol_raw_with_transport<T: CTraderOpenApiTransport>(
+    transport: &T,
+    request: &CTraderSymbolLookupRequest,
+) -> Result<CTraderResolvedSymbolRaw> {
     let account_id = request
         .account_id
         .parse::<i64>()
@@ -1465,10 +1479,15 @@ pub fn resolve_symbol_with_transport<T: CTraderOpenApiTransport>(
         .filter(|description| !description.trim().is_empty())
         .unwrap_or_else(|| light_symbol.symbol_name.clone());
 
-    Ok(CTraderResolvedSymbol {
+    let resolved = CTraderResolvedSymbol {
         account_id,
         light_symbol,
         symbol,
+    };
+    Ok(CTraderResolvedSymbolRaw {
+        resolved,
+        symbols_response_json: auth_responses[2].clone(),
+        symbol_response_json: detail_responses[2].clone(),
     })
 }
 

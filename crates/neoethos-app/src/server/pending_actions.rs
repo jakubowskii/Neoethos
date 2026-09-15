@@ -59,7 +59,7 @@ pub struct RejectBody {
 /// vs Failed) is stamped back onto the action so the UI / next
 /// /actions/pending response shows the final state.
 pub async fn confirm(
-    State(_state): State<AppApiState>,
+    State(state): State<AppApiState>,
     Path(id): Path<String>,
     body: Option<Json<ConfirmBody>>,
 ) -> Response {
@@ -108,8 +108,15 @@ pub async fn confirm(
                 )
                     .into_response();
             }
+            let recorded = state
+                .record_expected_broker_close(pos_id, vol)
+                .await
+                .is_ok();
             let result =
                 tokio::task::spawn_blocking(move || close_position_blocking(pos_id, vol)).await;
+            if recorded && !matches!(&result, Ok(Ok(_))) {
+                state.discard_expected_broker_close(pos_id).await;
+            }
             match result {
                 Ok(Ok(outcome)) => {
                     let note = format!(

@@ -161,6 +161,7 @@ pub async fn start_live(
             .into_response();
     }
 
+    let current_truth = state.broker_financial_truth_report().await;
     let mut slot = match state.live_trading.lock() {
         Ok(g) => g,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "state lock poisoned").into_response(),
@@ -196,6 +197,52 @@ pub async fn start_live(
             cull_min_win_rate_pct: body.cull_min_win_rate_pct,
             cull_window_trades: body.cull_window_trades,
         };
+        let artifact = match neoethos_search::load_live_portfolio_json(&path) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                failed.push(serde_json::json!({"portfolio": path, "error": error.to_string()}));
+                continue;
+            }
+        };
+        let current_ready = current_truth.require_live().is_ok();
+        let proof_truth = artifact
+            .promotion
+            .as_ref()
+            .map(|promotion| &promotion.broker_financial_truth);
+        let truth_matches = proof_truth.is_some_and(|proof| {
+            let same_historical_capabilities = [
+                neoethos_core::BrokerFinancialCapabilityKind::SynchronizedHistoricalBidAsk,
+                neoethos_core::BrokerFinancialCapabilityKind::SynchronizedConversionLegs,
+                neoethos_core::BrokerFinancialCapabilityKind::ExactProtoOaSymbolContract,
+            ]
+            .iter()
+            .all(|kind| {
+                let proof_capability = proof
+                    .capabilities
+                    .iter()
+                    .find(|capability| capability.kind == *kind);
+                let current_capability = current_truth
+                    .capabilities
+                    .iter()
+                    .find(|capability| capability.kind == *kind);
+                proof_capability == current_capability
+            });
+            proof.account_id == current_truth.account_id
+                && proof.account_currency == current_truth.account_currency
+                && proof.symbol_id == current_truth.symbol_id
+                && proof.symbol == current_truth.symbol
+                && proof.strategy_hash == current_truth.strategy_hash
+                && proof.risk_config_hash == current_truth.risk_config_hash
+                && proof.slippage_policy_hash == current_truth.slippage_policy_hash
+                && same_historical_capabilities
+        });
+        if !current_ready || !truth_matches {
+            failed.push(serde_json::json!({
+                "portfolio": path,
+                "error": "current authoritative broker financial truth is missing, stale, or does not match the portfolio promotion proof"
+            }));
+            continue;
+        }
         match crate::app_services::live_trading::start(req) {
             Ok(handle) => {
                 started.push(path);
