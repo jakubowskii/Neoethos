@@ -16,7 +16,7 @@
 //! trader needs to rebuild the EXACT matrix the genes were evolved against.
 //!
 //! Discovery writes it (`save_live_portfolio_json`, called next to
-//! `save_portfolio_json`); the trader reads it (`load_live_portfolio_json`) and
+//! `save_portfolio_json`); the trader reads it (`load_live_ready_portfolio_json`) and
 //! projects its freshly-computed features onto `effective_feature_names` with
 //! [`project_features_to_effective`] (the same by-name selection discovery's
 //! forward-test path uses).
@@ -24,10 +24,15 @@
 use std::path::Path;
 
 use neoethos_data::{FeatureData, FeatureFrame};
+use neoethos_core::contracts::{
+    ArtifactEnvelope, LivePromotionGate, LiveValidationEvidence, ValidationEvidenceKind,
+    ValidationEvidenceManifest,
+};
 use serde::{Deserialize, Serialize};
 
+use crate::artifact_io::stable_json_hash;
 use crate::Gene;
-use crate::discovery::DiscoveryResult;
+use crate::discovery::{DiscoveryResult, live_validation_evidence_from_discovery};
 
 /// Bumped when the artifact's shape changes incompatibly.
 pub const LIVE_PORTFOLIO_SCHEMA_VERSION: u32 = 1;
@@ -48,8 +53,30 @@ pub struct LivePortfolioArtifact {
     /// are NOT persisted, so the trader must recompute them the same way — see
     /// the design §6.1). Default discovery is `false`.
     pub normalize_features: bool,
-    /// The promoted portfolio — FULL genes, including SMC flags + SL/TP.
+    /// Candidate or promoted portfolio — FULL genes, including SMC flags + SL/TP.
     pub genes: Vec<Gene>,
+    /// Explicit live boundary. Missing on legacy artifacts, therefore `false`.
+    #[serde(default)]
+    pub promotion_ready: bool,
+    #[serde(default = "all_promotion_evidence_kinds")]
+    pub promotion_missing_evidence: Vec<ValidationEvidenceKind>,
+    #[serde(default)]
+    pub promotion_failed_evidence: Vec<ValidationEvidenceKind>,
+    /// Complete existing promotion contracts. `None` means candidate-only.
+    #[serde(default)]
+    pub promotion: Option<LivePortfolioPromotionProof>,
+}
+
+fn all_promotion_evidence_kinds() -> Vec<ValidationEvidenceKind> {
+    ValidationEvidenceKind::ALL.to_vec()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivePortfolioPromotionProof {
+    pub gate: LivePromotionGate,
+    pub artifact: ArtifactEnvelope<String>,
+    pub evidence_manifest: ValidationEvidenceManifest,
+    pub validation_evidence: LiveValidationEvidence,
 }
 
 impl LivePortfolioArtifact {
@@ -60,7 +87,7 @@ impl LivePortfolioArtifact {
         normalize_features: bool,
         result: &DiscoveryResult,
     ) -> Self {
-        Self {
+        let mut artifact = Self {
             schema_version: LIVE_PORTFOLIO_SCHEMA_VERSION,
             symbol: symbol.to_string(),
             base_tf: base_tf.to_string(),
@@ -68,8 +95,146 @@ impl LivePortfolioArtifact {
             effective_feature_names: result.effective_feature_names.clone(),
             normalize_features,
             genes: result.portfolio.clone(),
-        }
+            promotion_ready: false,
+            promotion_missing_evidence: Vec::new(),
+            promotion_failed_evidence: Vec::new(),
+            promotion: None,
+        };
+        artifact.record_discovery_promotion_status(result);
+        artifact
     }
+
+    pub fn with_validated_promotion(
+        mut self,
+        promotion: LivePortfolioPromotionProof,
+    ) -> anyhow::Result<Self> {
+        self.validate_promotion(&promotion)?;
+        self.promotion_ready = true;
+        self.promotion_missing_evidence.clear();
+        self.promotion_failed_evidence.clear();
+        self.promotion = Some(promotion);
+        Ok(self)
+    }
+
+    /// Independent final guard used by every live/autonomous consumer.
+    pub fn require_live_promotion_ready(&self) -> anyhow::Result<()> {
+        if !self.promotion_ready {
+            anyhow::bail!(
+                "live portfolio is not promotion-ready; missing evidence: {}; failed evidence: {}",
+                evidence_labels(&self.promotion_missing_evidence),
+                evidence_labels(&self.promotion_failed_evidence),
+            );
+        }
+        if !self.promotion_missing_evidence.is_empty()
+            || !self.promotion_failed_evidence.is_empty()
+        {
+            anyhow::bail!("live portfolio has inconsistent promotion evidence status");
+        }
+        let promotion = self
+            .promotion
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("live portfolio promotion proof is missing"))?;
+        self.validate_promotion(promotion)
+    }
+
+    fn subject_hash(&self) -> anyhow::Result<String> {
+        stable_json_hash(&(
+            &self.symbol,
+            &self.base_tf,
+            &self.higher_tfs,
+            &self.effective_feature_names,
+            self.normalize_features,
+            &self.genes,
+        ))
+    }
+
+    fn validate_promotion(&self, promotion: &LivePortfolioPromotionProof) -> anyhow::Result<()> {
+        if promotion.artifact.payload != self.subject_hash()? {
+            anyhow::bail!("live portfolio promotion proof does not match portfolio contents");
+        }
+        if !promotion.gate.require_deterministic {
+            anyhow::bail!("live portfolio promotion must require deterministic provenance");
+        }
+        let contract = &promotion.gate.live_execution_contract;
+        if !contract.require_walkforward_pass {
+            anyhow::bail!("live portfolio promotion must require walkforward evidence");
+        }
+        if !contract.require_forward_test_pass {
+            anyhow::bail!("live portfolio promotion must require forward_test evidence");
+        }
+        if !contract.require_prop_firm_pass {
+            anyhow::bail!("live portfolio promotion must require prop_firm evidence");
+        }
+        if contract
+            .required_live_sim_runtime_model_hash
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            anyhow::bail!(
+                "live portfolio promotion must require live_execution_simulation evidence"
+            );
+        }
+        promotion
+            .gate
+            .validate(&promotion.artifact, &promotion.evidence_manifest)
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        contract
+            .validate_evidence(&promotion.validation_evidence)
+            .map_err(|err| anyhow::anyhow!(err.to_string()))
+    }
+
+    fn record_discovery_promotion_status(&mut self, result: &DiscoveryResult) {
+        if result.canonical_backtest_artifacts.is_empty() {
+            self.promotion_missing_evidence
+                .push(ValidationEvidenceKind::CanonicalBacktest);
+        }
+        if result.walkforward_validation_artifacts.is_empty() {
+            self.promotion_missing_evidence
+                .push(ValidationEvidenceKind::WalkForward);
+        } else if !result.validation_gates.walkforward_passed {
+            self.promotion_failed_evidence
+                .push(ValidationEvidenceKind::WalkForward);
+        }
+
+        let evidence = live_validation_evidence_from_discovery(result);
+        match evidence.forward_test_passed {
+            None => self
+                .promotion_missing_evidence
+                .push(ValidationEvidenceKind::ForwardTest),
+            Some(false) => self
+                .promotion_failed_evidence
+                .push(ValidationEvidenceKind::ForwardTest),
+            Some(true) => {}
+        }
+        match evidence.prop_firm_passed {
+            None => self
+                .promotion_missing_evidence
+                .push(ValidationEvidenceKind::PropFirmRisk),
+            Some(false) => self
+                .promotion_failed_evidence
+                .push(ValidationEvidenceKind::PropFirmRisk),
+            Some(true) => {}
+        }
+        self.promotion_missing_evidence
+            .push(ValidationEvidenceKind::LiveExecutionSimulation);
+    }
+}
+
+fn evidence_labels(kinds: &[ValidationEvidenceKind]) -> String {
+    if kinds.is_empty() {
+        return "none".to_string();
+    }
+    kinds
+        .iter()
+        .map(|kind| match kind {
+            ValidationEvidenceKind::CanonicalBacktest => "canonical_backtest",
+            ValidationEvidenceKind::WalkForward => "walkforward",
+            ValidationEvidenceKind::ForwardTest => "forward_test",
+            ValidationEvidenceKind::LiveExecutionSimulation => "live_execution_simulation",
+            ValidationEvidenceKind::PropFirmRisk => "prop_firm",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Write the live portfolio artifact as pretty JSON. Additive — does NOT touch
@@ -108,6 +273,21 @@ pub fn load_live_portfolio_json(path: impl AsRef<Path>) -> anyhow::Result<LivePo
     let artifact: LivePortfolioArtifact = serde_json::from_str(&raw).map_err(|e| {
         anyhow::anyhow!(
             "live portfolio artifact {} is not valid: {e}",
+            path.as_ref().display()
+        )
+    })?;
+    Ok(artifact)
+}
+
+/// Load for trading. Candidate and legacy artifacts stay readable through
+/// [`load_live_portfolio_json`] but cannot cross this boundary without proof.
+pub fn load_live_ready_portfolio_json(
+    path: impl AsRef<Path>,
+) -> anyhow::Result<LivePortfolioArtifact> {
+    let artifact = load_live_portfolio_json(&path)?;
+    artifact.require_live_promotion_ready().map_err(|err| {
+        anyhow::anyhow!(
+            "live portfolio artifact {} rejected: {err}",
             path.as_ref().display()
         )
     })?;
@@ -162,9 +342,12 @@ pub fn project_features_to_effective(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neoethos_core::contracts::{
+        ArtifactKind, ArtifactProvenance, BackendKind, DeterminismPolicy, DeviceAssignment,
+        LiveExecutionContract, RuntimeMode,
+    };
 
-    #[test]
-    fn artifact_round_trips_through_json() {
+    fn candidate_artifact() -> LivePortfolioArtifact {
         let mut gene = Gene::default();
         gene.indices = vec![0, 2];
         gene.weights = vec![0.5, -0.25];
@@ -172,19 +355,246 @@ mod tests {
         gene.short_threshold = -0.1;
         gene.strategy_id = "test-gene".to_string();
 
-        let artifact = LivePortfolioArtifact {
+        LivePortfolioArtifact {
             schema_version: LIVE_PORTFOLIO_SCHEMA_VERSION,
             symbol: "EURGBP".to_string(),
             base_tf: "D1".to_string(),
             higher_tfs: vec!["W1".to_string()],
-            effective_feature_names: vec!["rsi".to_string(), "atr".to_string(), "W1_rsi".to_string()],
+            effective_feature_names: vec![
+                "rsi".to_string(),
+                "atr".to_string(),
+                "W1_rsi".to_string(),
+            ],
             normalize_features: false,
             genes: vec![gene],
+            promotion_ready: false,
+            promotion_missing_evidence: ValidationEvidenceKind::ALL.to_vec(),
+            promotion_failed_evidence: Vec::new(),
+            promotion: None,
+        }
+    }
+
+    fn complete_promotion(artifact: &LivePortfolioArtifact) -> LivePortfolioPromotionProof {
+        let provenance = ArtifactProvenance::new(
+            ArtifactKind::LiveReadyStrategy,
+            "feature-schema",
+            "dataset",
+            "symbols",
+            "timeframes",
+            "timestamps",
+            "availability",
+            "labels",
+            "training",
+            "search",
+            "runtime",
+            "risk",
+            DeterminismPolicy::Deterministic { seed: 42 },
+            "hardware",
+            DeviceAssignment::cpu(),
+            BackendKind::NativeCpu,
+            RuntimeMode::Canonical,
+            None,
+            "commit",
+        )
+        .unwrap();
+        let contract = LiveExecutionContract::new(
+            "feature-schema",
+            "timestamps",
+            "availability",
+            "symbols",
+            "runtime",
+            "risk",
+        )
+        .with_required_walkforward_pass()
+        .with_required_forward_test_pass()
+        .with_required_prop_firm_pass()
+        .with_required_live_sim_runtime_model_hash("live-model");
+        let gate = LivePromotionGate::new(contract).require_deterministic(true);
+        let envelope =
+            ArtifactEnvelope::new(provenance, artifact.subject_hash().unwrap()).unwrap();
+        let evidence_manifest = ValidationEvidenceManifest::new(
+            "canonical",
+            "walkforward",
+            "forward",
+            "live-sim",
+            "prop-firm",
+        )
+        .unwrap();
+        let validation_evidence = LiveValidationEvidence {
+            walkforward_passed: true,
+            cpcv_passed: false,
+            forward_test_passed: Some(true),
+            prop_firm_passed: Some(true),
+            live_sim_runtime_model_hash: Some("live-model".to_string()),
         };
+        LivePortfolioPromotionProof {
+            gate,
+            artifact: envelope,
+            evidence_manifest,
+            validation_evidence,
+        }
+    }
+
+    fn temp_portfolio_path(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{name}-{unique}.live_portfolio.json"))
+    }
+
+    #[test]
+    fn artifact_round_trips_through_json() {
+        let artifact = candidate_artifact();
 
         let json = serde_json::to_string(&artifact).unwrap();
         let back: LivePortfolioArtifact = serde_json::from_str(&json).unwrap();
         assert_eq!(artifact, back, "artifact must survive a JSON round-trip");
+    }
+
+    #[test]
+    fn legacy_artifact_loads_as_not_live_ready() {
+        let mut value = serde_json::to_value(candidate_artifact()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("promotion_ready");
+        object.remove("promotion_missing_evidence");
+        object.remove("promotion_failed_evidence");
+        object.remove("promotion");
+
+        let artifact: LivePortfolioArtifact = serde_json::from_value(value).unwrap();
+        assert!(!artifact.promotion_ready);
+        assert!(artifact.promotion.is_none());
+        assert_eq!(
+            artifact.promotion_missing_evidence,
+            ValidationEvidenceKind::ALL
+        );
+        assert!(artifact.require_live_promotion_ready().is_err());
+    }
+
+    #[test]
+    fn empty_manifest_cannot_promote() {
+        let artifact = candidate_artifact();
+        let mut proof = complete_promotion(&artifact);
+        proof.evidence_manifest = ValidationEvidenceManifest {
+            canonical_backtest_validation_hash: String::new(),
+            walkforward_validation_hash: String::new(),
+            forward_test_validation_hash: String::new(),
+            live_execution_simulation_hash: String::new(),
+            prop_firm_risk_validation_hash: String::new(),
+        };
+
+        assert!(artifact.with_validated_promotion(proof).is_err());
+    }
+
+    #[test]
+    fn every_missing_manifest_kind_blocks_promotion_with_named_evidence() {
+        let artifact = candidate_artifact();
+        for kind in ValidationEvidenceKind::ALL {
+            let mut proof = complete_promotion(&artifact);
+            match kind {
+                ValidationEvidenceKind::CanonicalBacktest => {
+                    proof.evidence_manifest.canonical_backtest_validation_hash.clear()
+                }
+                ValidationEvidenceKind::WalkForward => {
+                    proof.evidence_manifest.walkforward_validation_hash.clear()
+                }
+                ValidationEvidenceKind::ForwardTest => {
+                    proof.evidence_manifest.forward_test_validation_hash.clear()
+                }
+                ValidationEvidenceKind::LiveExecutionSimulation => {
+                    proof.evidence_manifest.live_execution_simulation_hash.clear()
+                }
+                ValidationEvidenceKind::PropFirmRisk => {
+                    proof.evidence_manifest.prop_firm_risk_validation_hash.clear()
+                }
+            }
+            let error = artifact
+                .clone()
+                .with_validated_promotion(proof)
+                .expect_err("missing manifest kind must reject promotion");
+            assert!(error.to_string().contains(kind.field_name()));
+        }
+    }
+
+    #[test]
+    fn failed_required_evidence_outcomes_block_promotion() {
+        let artifact = candidate_artifact();
+        let mut cases = Vec::new();
+
+        let mut walkforward = complete_promotion(&artifact);
+        walkforward.validation_evidence.walkforward_passed = false;
+        cases.push((walkforward, "walkforward"));
+
+        let mut forward = complete_promotion(&artifact);
+        forward.validation_evidence.forward_test_passed = Some(false);
+        cases.push((forward, "forward_test"));
+
+        let mut prop_firm = complete_promotion(&artifact);
+        prop_firm.validation_evidence.prop_firm_passed = Some(false);
+        cases.push((prop_firm, "prop_firm"));
+
+        let mut live_sim = complete_promotion(&artifact);
+        live_sim.validation_evidence.live_sim_runtime_model_hash =
+            Some("wrong-model".to_string());
+        cases.push((live_sim, "live_sim_runtime_model_hash"));
+
+        for (proof, expected) in cases {
+            let error = artifact
+                .clone()
+                .with_validated_promotion(proof)
+                .expect_err("failed required evidence must reject promotion");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn complete_promotion_round_trip_is_live_ready() {
+        let candidate = candidate_artifact();
+        let promoted = candidate
+            .clone()
+            .with_validated_promotion(complete_promotion(&candidate))
+            .expect("complete canonical proof must promote");
+        assert!(promoted.promotion_ready);
+        promoted.require_live_promotion_ready().unwrap();
+
+        let json = serde_json::to_string(&promoted).unwrap();
+        let round_trip: LivePortfolioArtifact = serde_json::from_str(&json).unwrap();
+        assert!(round_trip.promotion_ready);
+        round_trip.require_live_promotion_ready().unwrap();
+
+        let path = temp_portfolio_path("complete-promotion");
+        std::fs::write(&path, json).unwrap();
+        load_live_ready_portfolio_json(&path).expect("strict loader must accept complete proof");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn strict_loader_rejects_candidate_regardless_of_filename() {
+        let path = temp_portfolio_path("promoted-and-ready");
+        std::fs::write(&path, serde_json::to_vec(&candidate_artifact()).unwrap()).unwrap();
+
+        let loose = load_live_portfolio_json(&path).expect("candidate remains readable");
+        assert!(!loose.promotion_ready);
+        let error =
+            load_live_ready_portfolio_json(&path).expect_err("candidate must not trade");
+        assert!(error.to_string().contains("not promotion-ready"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn proof_cannot_be_reused_after_portfolio_tampering() {
+        let candidate = candidate_artifact();
+        let mut promoted = candidate
+            .clone()
+            .with_validated_promotion(complete_promotion(&candidate))
+            .unwrap();
+        promoted.genes[0].long_threshold += 0.01;
+
+        let error = promoted
+            .require_live_promotion_ready()
+            .expect_err("proof must bind to exact portfolio contents");
+        assert!(error.to_string().contains("does not match portfolio contents"));
     }
 
     #[test]

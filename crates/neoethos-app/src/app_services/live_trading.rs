@@ -346,7 +346,7 @@ async fn run(
     status: Arc<std::sync::Mutex<LiveTradingStatus>>,
 ) -> Result<()> {
     // Load portfolio artifact (same as replay_portfolio_from_dir)
-    let artifact = neoethos_search::load_live_portfolio_json(&req.portfolio_path)
+    let artifact = neoethos_search::load_live_ready_portfolio_json(&req.portfolio_path)
         .with_context(|| format!("load live portfolio {}", req.portfolio_path))?;
 
     if artifact.genes.is_empty() {

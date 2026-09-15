@@ -100,7 +100,7 @@ pub fn replay_portfolio_from_dir(
     portfolio_path: impl AsRef<Path>,
     cfg: EngineConfig,
 ) -> anyhow::Result<EngineStats> {
-    let artifact = neoethos_search::load_live_portfolio_json(&portfolio_path)?;
+    let artifact = neoethos_search::load_live_ready_portfolio_json(&portfolio_path)?;
     if artifact.genes.is_empty() {
         anyhow::bail!(
             "live portfolio {} has no genes to trade",
@@ -198,7 +198,7 @@ pub fn replay_blend_from_dir(
 ) -> anyhow::Result<EngineStats> {
     use crate::blend_signal::{BlendMode, BlendedSignalEngine, MlDecision};
 
-    let artifact = neoethos_search::load_live_portfolio_json(&portfolio_path)?;
+    let artifact = neoethos_search::load_live_ready_portfolio_json(&portfolio_path)?;
     if artifact.genes.is_empty() {
         anyhow::bail!(
             "live portfolio {} has no genes to trade",
@@ -308,4 +308,33 @@ pub fn replay_blend_from_dir(
         cfg,
     );
     Ok(crate::replay::replay(&mut engine, &bars))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autonomous_replay_rejects_candidate_before_reading_market_data() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("candidate-{unique}.json"));
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"symbol":"EURUSD","base_tf":"H1","higher_tfs":[],"effective_feature_names":[],"normalize_features":false,"genes":[]}"#,
+        )
+        .unwrap();
+
+        let error = replay_portfolio_from_dir(
+            std::env::temp_dir().join("market-data-must-not-be-read"),
+            &path,
+            EngineConfig::default(),
+        )
+        .expect_err("candidate artifact must not enter autonomous replay");
+        assert!(error.to_string().contains("not promotion-ready"), "{error}");
+
+        let _ = std::fs::remove_file(path);
+    }
 }

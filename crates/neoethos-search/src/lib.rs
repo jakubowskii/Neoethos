@@ -111,8 +111,9 @@ pub use discovery_ledger::{
     save_discovery_ledger, seed_seen_from_ledger,
 };
 pub use live_portfolio::{
-    LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, load_live_portfolio_json,
-    project_features_to_effective, save_live_portfolio_json,
+    LIVE_PORTFOLIO_SCHEMA_VERSION, LivePortfolioArtifact, LivePortfolioPromotionProof,
+    load_live_portfolio_json, load_live_ready_portfolio_json, project_features_to_effective,
+    save_live_portfolio_json,
 };
 pub use neoethos_core::contracts::DeterminismPolicy;
 pub use orchestration::{BatchDiscoverySummary, DiscoveryOrchestrator};

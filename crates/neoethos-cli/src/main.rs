@@ -2717,7 +2717,7 @@ fn cmd_live_signal(args: &[String]) -> Result<()> {
         .unwrap_or(1000);
 
     // Load portfolio artifact
-    let artifact = neoethos_search::load_live_portfolio_json(&portfolio_path)
+    let artifact = neoethos_search::load_live_ready_portfolio_json(&portfolio_path)
         .with_context(|| format!("load portfolio {portfolio_path}"))?;
 
     if artifact.genes.is_empty() {

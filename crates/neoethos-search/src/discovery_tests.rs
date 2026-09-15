@@ -1642,6 +1642,55 @@ fn portfolio_export_uses_effective_names_after_validation_gates_pass() {
 }
 
 #[test]
+fn five_gate_candidate_exports_without_claiming_live_readiness() {
+    let mut result = DiscoveryResult {
+        portfolio: vec![profitable_gene("alpha-1")],
+        candidates: Vec::new(),
+        quality_metrics: Vec::new(),
+        logged_trades: Vec::new(),
+        effective_feature_names: vec!["filtered_signal".to_string()],
+        validation_gates: DiscoveryValidationGates::pending(),
+        canonical_backtest_artifacts: vec![sample_canonical_backtest_artifact("canonical")],
+        walkforward_validation_artifacts: vec![sample_walkforward_validation_artifact(
+            "walkforward",
+        )],
+        forward_test_validation_artifacts: Vec::new(),
+        prop_firm_validation_artifacts: Vec::new(),
+        funnel_profile: None,
+    };
+    mark_all_mandatory_gates_passed(&mut result);
+    let path = temp_path("candidate-not-live-ready");
+    let live_path = temp_path("candidate-live-boundary");
+
+    save_portfolio_json(&path, &result).expect("five-gate candidate export must remain valid");
+    crate::save_live_portfolio_json(
+        &live_path,
+        "EURUSD",
+        "H1",
+        &["H4".to_string()],
+        &result,
+    )
+    .expect("candidate live portfolio serialization must remain valid");
+    let artifact = crate::load_live_portfolio_json(&live_path).expect("candidate artifact loads");
+
+    assert!(!artifact.promotion_ready);
+    assert!(artifact.promotion.is_none());
+    assert_eq!(
+        artifact.promotion_missing_evidence,
+        vec![
+            neoethos_core::ValidationEvidenceKind::ForwardTest,
+            neoethos_core::ValidationEvidenceKind::PropFirmRisk,
+            neoethos_core::ValidationEvidenceKind::LiveExecutionSimulation,
+        ]
+    );
+    assert!(artifact.require_live_promotion_ready().is_err());
+    assert!(crate::load_live_ready_portfolio_json(&live_path).is_err());
+
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(live_path);
+}
+
+#[test]
 fn discovery_profile_exports_validation_gate_status() {
     let mut result = DiscoveryResult {
         portfolio: vec![profitable_gene("alpha-1")],
